@@ -7,3 +7,8 @@ httpx==0.28.1
 langfuse==3.2.1
 PyYAML==6.0.3
 pytest==8.3.5
+
+# Dashboard (app/dashboard/main.py)
+streamlit==1.61.1
+pandas==3.0.5
+plotly==6.9.0

@@ -1,1330 +1,1511 @@
 """
-Day 13 AI Observability Dashboard
-==================================
-Production-grade Streamlit dashboard for monitoring AI service metrics.
-Monitors 6 required panels: latency, traffic, errors, cost, tokens, quality.
-Supports SLO thresholds, real-time updates, incident injection for demos.
+Day 13 AI Observability Dashboard — Demo Edition
+================================================
+Bố cục bám đúng "Kịch bản demo cuối giờ" (index.html), 5–7 phút / nhóm:
+
+    GATE  — Điều kiện "demo đạt": validate_logs >= 80/100 · dashboard 6/6 panel · traces >= 10
+    01    — API hoạt động         (health, correlation ID, latency/token/cost/quality)
+    02    — Logging & bảo mật     (log JSON, correlation ID chung, PII redaction)
+    03    — Dashboard             (6 panel theo contract + baseline + SLO threshold)
+    04    — Langfuse              (traces, drill-down một trace, prompt v1/v2)
+    05    — Demo một incident     (Metric -> Trace -> Log -> Root cause -> Fix -> Prevention)
+    06    — Kết quả kiểm tra      (validators + pytest chạy thật)
+
+Nguồn dữ liệu: data/logs.jsonl · Contract: config/dashboard.yaml · SLO: config/slo.yaml
+
+Chạy:  streamlit run app/dashboard/main.py
 
 Author: Metrics & Dashboard Engineer (Member C)
 """
 
-import streamlit as st
-import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
-import yaml
-import numpy as np
-from pathlib import Path
-from datetime import datetime, timedelta
-from collections import Counter
-import io
+from __future__ import annotations
+
+import importlib.util
 import json
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+import yaml
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# CONFIGURATION
+# PATHS & CONSTANTS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-DATA_FILE = Path(__file__).parent.parent.parent / "data" / "logs.jsonl"
-SLO_CONFIG = Path(__file__).parent.parent.parent / "config" / "slo.yaml"
-ALERT_CONFIG = Path(__file__).parent.parent.parent / "config" / "alert_rules.yaml"
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
-REFRESH_SECONDS = 30
-DEFAULT_TIME_RANGE = 60
+DATA_FILE = REPO_ROOT / "data" / "logs.jsonl"
+DASHBOARD_CONTRACT = REPO_ROOT / "config" / "dashboard.yaml"
+SLO_CONFIG = REPO_ROOT / "config" / "slo.yaml"
+ALERT_CONFIG = REPO_ROOT / "config" / "alert_rules.yaml"
 
-# ─── Load SLO thresholds from config ─────────────────────────────────────────
-def load_slo_config() -> dict:
-    """Load SLO objectives from config/slo.yaml."""
-    if SLO_CONFIG.exists():
-        with open(SLO_CONFIG) as f:
-            config = yaml.safe_load(f)
-            slis = config.get("slis", {})
-            return {key: values["objective"] for key, values in slis.items()}
-    # Fallback defaults matching config/slo.yaml
-    return {
-        "latency_p95_ms": 3000,
-        "error_rate_pct": 2.0,
-        "daily_cost_usd": 2.5,
-        "quality_score_avg": 0.75,
-    }
+# Ngưỡng của mục "Điều kiện demo đạt" trong kịch bản demo.
+PASS_LOG_SCORE = 80
+PASS_PANEL_COUNT = 6
+PASS_TRACE_COUNT = 10
 
-# ─── Load alert rules ────────────────────────────────────────────────────────
-def load_alert_rules() -> list:
-    """Load alert rules from config/alert_rules.yaml."""
-    if ALERT_CONFIG.exists():
-        with open(ALERT_CONFIG) as f:
-            config = yaml.safe_load(f)
-            return config.get("alerts", [])
-    return []
+# Palette đồng bộ với trang kịch bản demo (index.html).
+C_CYAN, C_BLUE, C_VIOLET = "#5ce1e6", "#61a8ff", "#9b7bff"
+C_GREEN, C_YELLOW, C_RED = "#56df9b", "#ffc95c", "#ff667a"
+C_MUTED = "#9db0c7"
 
-SLO = load_slo_config()
-ALERT_RULES = load_alert_rules()
+VIEWS = [
+    "🏁 Toàn cảnh (evidence)",
+    "01 · API hoạt động",
+    "02 · Logging & bảo mật",
+    "03 · Dashboard 6 panel",
+    "04 · Langfuse & prompt",
+    "05 · Demo một incident",
+    "06 · Kết quả kiểm tra",
+]
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# PAGE CONFIGURATION
+# PAGE CONFIG  (phải là lệnh Streamlit đầu tiên)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 st.set_page_config(
-    page_title="Day 13 Observability",
+    page_title="Day 13 Observability — Demo",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# CUSTOM CSS - Dark Theme Observability Style
-# ═══════════════════════════════════════════════════════════════════════════════
-
-st.markdown("""
+st.markdown(
+    """
 <style>
-    /* ─── Root Variables ─────────────────────────────────────────────────── */
-    :root {
-        --bg-primary: #0e1117;
-        --bg-secondary: #161b22;
-        --bg-card: #1c2128;
-        --border-color: #30363d;
-        --text-primary: #e6edf3;
-        --text-secondary: #8b949e;
-        --accent-green: #3fb950;
-        --accent-red: #f85149;
-        --accent-yellow: #d29922;
-        --accent-blue: #58a6ff;
-        --accent-purple: #a371f7;
+    :root{
+        --bg:#07111f; --card:#0f1c2e; --card-2:#13243a;
+        --line:rgba(255,255,255,.10); --text:#f7f9fc; --muted:#9db0c7;
+        --cyan:#5ce1e6; --blue:#61a8ff; --violet:#9b7bff;
+        --green:#56df9b; --yellow:#ffc95c; --red:#ff667a;
     }
+    .stApp{
+        background:
+            radial-gradient(circle at 8% 0%, rgba(92,225,230,.10), transparent 26%),
+            radial-gradient(circle at 92% 6%, rgba(155,123,255,.11), transparent 30%),
+            linear-gradient(180deg,#06101c 0%,#091625 45%,#07111f 100%);
+        color:var(--text);
+    }
+    section[data-testid="stSidebar"]{ background:#08131f; border-right:1px solid var(--line); }
 
-    /* ─── Global Styles ──────────────────────────────────────────────────── */
-    .stApp {
-        background: linear-gradient(135deg, var(--bg-primary) 0%, #0d1117 100%);
-        color: var(--text-primary);
+    .ctx-bar{
+        display:flex; flex-wrap:wrap; gap:8px; align-items:center;
+        padding:10px 14px; margin:2px 0 14px;
+        border:1px solid var(--line); border-radius:14px;
+        background:rgba(255,255,255,.035);
     }
-    
-    /* ─── Cards & Containers ─────────────────────────────────────────────── */
-    .metric-card {
-        background: var(--bg-card);
-        border: 1px solid var(--border-color);
-        border-radius: 12px;
-        padding: 1.25rem;
-        margin: 0.5rem 0;
-        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
-        transition: all 0.3s ease;
+    .ctx-bar .chip{
+        padding:5px 10px; border-radius:9px; font-size:12.5px; font-weight:700;
+        border:1px solid var(--line); background:rgba(255,255,255,.045); color:#dbe7f4;
     }
-    
-    .metric-card:hover {
-        border-color: var(--accent-blue);
-        box-shadow: 0 6px 12px rgba(88, 166, 255, 0.15);
+    .ctx-bar .chip b{ color:#fff; }
+
+    .gate{
+        padding:16px 18px; border-radius:18px; border:1px solid var(--line);
+        background:linear-gradient(180deg, rgba(15,28,46,.92), rgba(11,24,40,.88));
+        height:100%;
     }
-    
-    .panel-card {
-        background: var(--bg-card);
-        border: 1px solid var(--border-color);
-        border-radius: 16px;
-        padding: 1.5rem;
-        margin: 0.75rem 0;
-        box-shadow: 0 4px 8px rgba(0, 0, 0, 0.25);
+    .gate .label{
+        color:var(--muted); font-size:11.5px; font-weight:800;
+        letter-spacing:.09em; text-transform:uppercase;
     }
-    
-    .panel-header {
-        font-size: 1.1rem;
-        font-weight: 600;
-        color: var(--text-primary);
-        margin-bottom: 1rem;
-        padding-bottom: 0.75rem;
-        border-bottom: 2px solid var(--border-color);
-        display: flex;
-        align-items: center;
-        gap: 0.5rem;
+    .gate .big{ margin:7px 0 2px; font-size:31px; font-weight:900; letter-spacing:-.03em; line-height:1; }
+    .gate .desc{ color:#c9d6e3; font-size:12.5px; }
+    .gate.pass{ border-color:rgba(86,223,155,.42); }
+    .gate.fail{ border-color:rgba(255,102,122,.48); }
+
+    .step{
+        padding:15px 16px; border-radius:15px; border:1px solid var(--line);
+        background:rgba(255,255,255,.035); height:100%;
     }
-    
-    /* ─── Status Indicators ──────────────────────────────────────────────── */
-    .status-ok {
-        color: var(--accent-green);
-        font-weight: 700;
+    .step small{
+        color:#83a2bd; font-weight:800; font-size:10px;
+        letter-spacing:.09em; text-transform:uppercase;
     }
-    
-    .status-breach {
-        color: var(--accent-red);
-        font-weight: 700;
-        animation: pulse 2s infinite;
+    .step .title{ font-size:14.5px; font-weight:800; margin:5px 0 7px; }
+    .step .body{ color:#cddaeb; font-size:12.5px; line-height:1.5; }
+    .step .body code{ font-size:11.5px; }
+
+    .panel-title{
+        display:flex; align-items:baseline; gap:10px; flex-wrap:wrap;
+        margin:0 0 2px;
     }
-    
-    .status-warning {
-        color: var(--accent-yellow);
-        font-weight: 700;
+    .panel-title .pid{
+        font:800 10.5px "SFMono-Regular",Consolas,monospace; letter-spacing:.1em;
+        text-transform:uppercase; color:var(--cyan);
+        border:1px solid rgba(92,225,230,.28); background:rgba(92,225,230,.08);
+        padding:2px 7px; border-radius:6px;
     }
-    
-    @keyframes pulse {
-        0%, 100% { opacity: 1; }
-        50% { opacity: 0.6; }
+    .panel-title h4{ margin:0; font-size:16.5px; letter-spacing:-.01em; }
+    .panel-meta{ color:var(--muted); font-size:11.5px; margin:0 0 10px; }
+    .panel-meta b{ color:#dbe7f4; }
+
+    .verdict-ok{ color:var(--green); font-weight:800; }
+    .verdict-bad{ color:var(--red); font-weight:800; }
+    .verdict-warn{ color:var(--yellow); font-weight:800; }
+
+    .lede{ color:var(--muted); font-size:13.5px; margin:-6px 0 14px; }
+
+    code{
+        color:#b9f7f8; background:rgba(92,225,230,.08);
+        border:1px solid rgba(255,255,255,.08); border-radius:6px; padding:1px 5px;
     }
-    
-    /* ─── SLO Header Bar ─────────────────────────────────────────────────── */
-    .slo-header {
-        background: linear-gradient(90deg, var(--bg-secondary) 0%, var(--bg-card) 100%);
-        border: 1px solid var(--border-color);
-        border-radius: 12px;
-        padding: 1rem 1.5rem;
-        margin-bottom: 1rem;
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-    }
-    
-    /* ─── Alert Banner ───────────────────────────────────────────────────── */
-    .alert-banner {
-        background: linear-gradient(90deg, rgba(248, 81, 73, 0.15) 0%, rgba(248, 81, 73, 0.05) 100%);
-        border: 1px solid var(--accent-red);
-        border-radius: 8px;
-        padding: 0.75rem 1rem;
-        margin: 0.5rem 0;
-        display: flex;
-        align-items: center;
-        gap: 0.75rem;
-    }
-    
-    .alert-banner.warning {
-        background: linear-gradient(90deg, rgba(210, 153, 34, 0.15) 0%, rgba(210, 153, 34, 0.05) 100%);
-        border-color: var(--accent-yellow);
-    }
-    
-    /* ─── Sparkline Container ────────────────────────────────────────────── */
-    .sparkline-container {
-        display: flex;
-        align-items: flex-end;
-        gap: 2px;
-        height: 30px;
-        margin-top: 0.5rem;
-    }
-    
-    /* ─── Sidebar Styling ────────────────────────────────────────────────── */
-    .css-1d391kg {
-        background-color: var(--bg-secondary);
-    }
-    
-    /* ─── Metrics Styling ────────────────────────────────────────────────── */
-    div[data-testid="stMetricValue"] {
-        font-size: 1.75rem !important;
-        font-weight: 700 !important;
-    }
-    
-    div[data-testid="stMetricLabel"] {
-        font-size: 0.85rem !important;
-        color: var(--text-secondary) !important;
-    }
-    
-    /* ─── Charts ─────────────────────────────────────────────────────────── */
-    .js-plotly-plot .plotly .modebar {
-        background: transparent !important;
-    }
-    
-    /* ─── Timestamp ─────────────────────────────────────────────────────── */
-    .last-updated {
-        color: var(--text-secondary);
-        font-size: 0.8rem;
-        text-align: right;
-        padding: 0.5rem;
-    }
-    
-    /* ─── Incident Indicator ─────────────────────────────────────────────── */
-    .incident-active {
-        background: linear-gradient(90deg, rgba(248, 81, 73, 0.2) 0%, transparent 100%);
-        border-left: 4px solid var(--accent-red);
-        padding: 0.5rem 1rem;
-        margin: 0.25rem 0;
-    }
-    
-    /* ─── Custom Scrollbar ───────────────────────────────────────────────── */
-    ::-webkit-scrollbar {
-        width: 8px;
-        height: 8px;
-    }
-    
-    ::-webkit-scrollbar-track {
-        background: var(--bg-secondary);
-    }
-    
-    ::-webkit-scrollbar-thumb {
-        background: var(--border-color);
-        border-radius: 4px;
-    }
-    
-    ::-webkit-scrollbar-thumb:hover {
-        background: var(--text-secondary);
-    }
-    
-    /* ─── Button Styling ──────────────────────────────────────────────────── */
-    .stButton > button {
-        background: linear-gradient(135deg, var(--accent-blue) 0%, #1f6feb 100%);
-        color: white;
-        border: none;
-        border-radius: 8px;
-        padding: 0.5rem 1rem;
-        font-weight: 600;
-        transition: all 0.2s ease;
-    }
-    
-    .stButton > button:hover {
-        transform: translateY(-1px);
-        box-shadow: 0 4px 12px rgba(88, 166, 255, 0.3);
-    }
-    
-    /* ─── Export Button ──────────────────────────────────────────────────── */
-    .export-btn {
-        background: linear-gradient(135deg, var(--accent-purple) 0%, #8957e5 100%);
-    }
+    hr{ border-color:var(--line); }
 </style>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SESSION STATE
+# CONFIG LOADERS — dashboard đọc thẳng từ contract để ảnh chụp luôn khớp validator
 # ═══════════════════════════════════════════════════════════════════════════════
 
-if "incident_mode" not in st.session_state:
-    st.session_state.incident_mode = False
-if "last_incident_time" not in st.session_state:
-    st.session_state.last_incident_time = None
-if "refresh_count" not in st.session_state:
-    st.session_state.refresh_count = 0
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# SIDEBAR - Settings & Controls
-# ═══════════════════════════════════════════════════════════════════════════════
+@st.cache_data(show_spinner=False)
+def load_contract() -> dict:
+    """Đọc config/dashboard.yaml: đây là contract chấm điểm 6 panel."""
+    if not DASHBOARD_CONTRACT.exists():
+        return {}
+    payload = yaml.safe_load(DASHBOARD_CONTRACT.read_text(encoding="utf-8")) or {}
+    dashboard = payload.get("dashboard", {})
+    dashboard["panels_by_id"] = {p["id"]: p for p in dashboard.get("panels", []) if "id" in p}
+    return dashboard
 
-with st.sidebar:
-    st.markdown("## ⚙️ Dashboard Controls")
-    st.divider()
-    
-    # ─── Time Range Selector ───────────────────────────────────────────────
-    st.markdown("### 📅 Time Range")
-    time_options = {
-        "30 minutes": 30,
-        "60 minutes (default)": 60,
-        "2 hours": 120,
-        "24 hours": 1440,
-    }
-    selected_label = st.selectbox(
-        "Select window",
-        list(time_options.keys()),
-        index=1,
-        label_visibility="collapsed"
+
+@st.cache_data(show_spinner=False)
+def load_slo() -> dict:
+    """Objective của từng SLI trong config/slo.yaml."""
+    if not SLO_CONFIG.exists():
+        return {"latency_p95_ms": 3000, "error_rate_pct": 2.0, "daily_cost_usd": 2.5, "quality_score_avg": 0.75}
+    config = yaml.safe_load(SLO_CONFIG.read_text(encoding="utf-8")) or {}
+    return {key: values["objective"] for key, values in config.get("slis", {}).items()}
+
+
+@st.cache_data(show_spinner=False)
+def load_alerts() -> list[dict]:
+    if not ALERT_CONFIG.exists():
+        return []
+    config = yaml.safe_load(ALERT_CONFIG.read_text(encoding="utf-8")) or {}
+    return config.get("alerts", [])
+
+
+@st.cache_data(show_spinner=False)
+def load_pii_detectors() -> dict:
+    """
+    Nạp đúng bộ regex mà scripts/validate_logs.py dùng để chấm điểm.
+
+    Dashboard soi PII bằng chính detector của grader, không dùng bản sao riêng,
+    nên con số "PII leak" trên màn hình luôn khớp điểm validator.
+    """
+    spec = importlib.util.spec_from_file_location(
+        "_grader_validate_logs", REPO_ROOT / "scripts" / "validate_logs.py"
     )
-    time_range_min = time_options[selected_label]
-    
-    st.divider()
-    
-    # ─── Auto-Refresh Toggle ───────────────────────────────────────────────
-    st.markdown("### 🔄 Auto-Refresh")
-    auto_refresh = st.checkbox(f"Enable ({REFRESH_SECONDS}s interval)", value=True)
-    
-    # Refresh indicator
-    if auto_refresh:
-        st.session_state.refresh_count += 1
-        st.markdown(f"""
-        <div style="display: flex; align-items: center; gap: 8px; padding: 8px;">
-            <span style="width: 10px; height: 10px; background: var(--accent-green); 
-                  border-radius: 50%; animation: pulse 1.5s infinite;"></span>
-            <span style="color: var(--text-secondary); font-size: 0.85rem;">
-                Live • Refresh #{st.session_state.refresh_count}
-            </span>
+    if spec is None or spec.loader is None:
+        return {}
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return dict(getattr(module, "PII_DETECTORS", {}))
+
+
+CONTRACT = load_contract()
+PANELS = CONTRACT.get("panels_by_id", {})
+SLO = load_slo()
+ALERTS = load_alerts()
+CONTRACT_RANGE_MIN = int(CONTRACT.get("time_range_minutes", 60))
+CONTRACT_REFRESH_S = int(CONTRACT.get("refresh_seconds", 30))
+
+
+def panel_threshold(panel_id: str) -> tuple[str, str, float] | None:
+    """(aggregation, operator, value) của threshold trong contract."""
+    threshold = PANELS.get(panel_id, {}).get("threshold")
+    if not isinstance(threshold, dict):
+        return None
+    return threshold.get("aggregation", ""), threshold.get("operator", ""), threshold.get("value", 0)
+
+
+def panel_header(panel_id: str, fallback_title: str, extra: str = "") -> None:
+    """Header hiển thị tên panel + đơn vị + threshold — bắt buộc có trong ảnh evidence."""
+    panel = PANELS.get(panel_id, {})
+    title = panel.get("title", fallback_title)
+    unit = panel.get("unit", "—")
+    threshold = panel_threshold(panel_id)
+    op_text = {"lte": "≤", "gte": "≥"}
+    if threshold:
+        aggregation, operator, value = threshold
+        threshold_text = f"threshold <b>{aggregation} {op_text.get(operator, operator)} {value}</b>"
+    else:
+        threshold_text = "threshold <b>—</b>"
+
+    st.markdown(
+        f"""
+        <div class="panel-title">
+            <span class="pid">{panel_id}</span><h4>{title}</h4>
         </div>
-        """, unsafe_allow_html=True)
-    
-    st.divider()
-    
-    # ─── Incident Injection Controls ──────────────────────────────────────
-    st.markdown("### 🔧 Demo Controls")
-    st.caption("For testing alert behavior")
-    
-    if st.button("🚨 Inject Test Incident", use_container_width=True):
-        st.session_state.incident_mode = True
-        st.session_state.last_incident_time = datetime.now()
-        st.rerun()
-    
-    if st.button("✓ Clear Incident", use_container_width=True):
-        st.session_state.incident_mode = False
-        st.rerun()
-    
-    if st.session_state.incident_mode:
-        st.markdown(f"""
-        <div class="incident-active">
-            <strong>⚠️ INCIDENT ACTIVE</strong><br>
-            <small>Injected: {st.session_state.last_incident_time.strftime('%H:%M:%S')}</small>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    st.divider()
-    
-    # ─── Correlation ID Lookup ────────────────────────────────────────────
-    st.markdown("### 🔍 Trace Lookup")
-    correlation_id = st.text_input(
-        "Correlation ID",
-        placeholder="e.g., req-abc123",
-        label_visibility="collapsed"
+        <div class="panel-meta">unit <b>{unit}</b> · {threshold_text}{(" · " + extra) if extra else ""}</div>
+        """,
+        unsafe_allow_html=True,
     )
-    
-    if st.button("Search Trace", use_container_width=True) and correlation_id:
-        # Enhancement: implement trace lookup
-        st.info(f"Looking up trace: {correlation_id}")
-    
-    st.divider()
-    
-    # ─── Export Metrics ────────────────────────────────────────────────────
-    st.markdown("### 📥 Export")
-    
-    def get_metrics_csv(df: pd.DataFrame) -> bytes:
-        """Generate CSV of current metrics snapshot."""
-        metrics = snapshot_metrics(df)
-        df_export = pd.DataFrame([metrics])
-        return df_export.to_csv(index=False).encode()
-    
-    csv_data = None
-    if "df" in locals():
-        csv_data = get_metrics_csv(df)
-    
-    st.download_button(
-        "📊 Export Metrics CSV",
-        data=csv_data or b"",
-        file_name=f"metrics_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-        mime="text/csv",
-        use_container_width=True,
-        disabled=csv_data is None,
-    )
-    
-    st.divider()
-    
-    # ─── About ────────────────────────────────────────────────────────────
-    st.markdown("""
-    <div style="color: var(--text-secondary); font-size: 0.75rem; text-align: center;">
-        Day 13 Observability Lab<br>
-        Streamlit Dashboard v1.0<br>
-        <br>
-        <strong>Panels:</strong><br>
-        • Latency (P50/P95/P99)<br>
-        • Traffic (req/min)<br>
-        • Error Rate (%)<br>
-        • Cost (USD)<br>
-        • Tokens (in/out)<br>
-        • Quality Score
-    </div>
-    """, unsafe_allow_html=True)
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # DATA LOADING
 # ═══════════════════════════════════════════════════════════════════════════════
 
-@st.cache_data(ttl=REFRESH_SECONDS if auto_refresh else None, show_spinner=False)
-def load_logs() -> pd.DataFrame:
+
+@st.cache_data(ttl=CONTRACT_REFRESH_S, show_spinner=False)
+def load_logs() -> tuple[pd.DataFrame, list[str], int]:
     """
-    Load and filter logs from data/logs.jsonl.
-    
-    Filters by time range selected in sidebar.
-    Parses JSONL format with error handling for malformed entries.
-    
-    Returns:
-        pd.DataFrame: Filtered log data
+    Đọc toàn bộ data/logs.jsonl.
+
+    Trả về (DataFrame, danh sách dòng JSON thô, số dòng hỏng) — dòng thô giữ lại
+    để phần 02 show đúng log JSON gốc thay vì bản đã qua pandas.
     """
     if not DATA_FILE.exists():
-        return pd.DataFrame()
-    
-    records = []
-    with open(DATA_FILE) as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                try:
-                    records.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue  # Skip malformed lines
-    
+        return pd.DataFrame(), [], 0
+
+    records: list[dict] = []
+    raw_lines: list[str] = []
+    malformed = 0
+    for line in DATA_FILE.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            records.append(json.loads(line))
+            raw_lines.append(line)
+        except json.JSONDecodeError:
+            malformed += 1
+
+    if not records:
+        return pd.DataFrame(), raw_lines, malformed
+
     df = pd.DataFrame(records)
-    
-    if "ts" in df.columns or "timestamp" in df.columns:
-        ts_col = "ts" if "ts" in df.columns else "timestamp"
-        df[ts_col] = pd.to_datetime(df[ts_col], errors="coerce", utc=True)
-        cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(minutes=time_range_min)
-        df = df[df[ts_col] >= cutoff].copy()
-    
-    return df
-
-# ─── Load data ────────────────────────────────────────────────────────────────
-df = load_logs()
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# HELPER FUNCTIONS
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def get_slo_status(value: float, target: float, lower_is_better: bool = True) -> tuple:
-    """
-    Determine SLO status based on value vs target.
-    
-    Args:
-        value: Current metric value
-        target: SLO target threshold
-        lower_is_better: If True, breach when value > target
-        
-    Returns:
-        tuple: (status_text, css_class, is_breach)
-    """
-    if lower_is_better:
-        is_breach = value > target
-    else:
-        is_breach = value < target
-    
-    if is_breach:
-        return "BREACH", "status-breach", True
-    return "OK", "status-ok", False
+    if "ts" in df.columns:
+        df["ts"] = pd.to_datetime(df["ts"], errors="coerce", utc=True)
+        df = df.sort_values("ts").reset_index(drop=True)
+    return df, raw_lines, malformed
 
 
-def snapshot_metrics(data: pd.DataFrame) -> dict:
-    """
-    Generate metrics snapshot for export.
-    
-    Args:
-        data: Full DataFrame
-        
-    Returns:
-        dict: Current values for all SLO metrics
-    """
-    response_df = data[data["event"] == "response_sent"] if "event" in data.columns else pd.DataFrame()
-    failed_df = data[data["event"] == "request_failed"] if "event" in data.columns else pd.DataFrame()
-    received_df = data[data["event"] == "request_received"] if "event" in data.columns else pd.DataFrame()
-    
+def event_subset(df: pd.DataFrame, event: str) -> pd.DataFrame:
+    if df.empty or "event" not in df.columns:
+        return pd.DataFrame()
+    return df[df["event"] == event]
+
+
+def payload_field(df: pd.DataFrame, key: str) -> pd.Series:
+    if df.empty or "payload" not in df.columns:
+        return pd.Series(dtype="object")
+    return df["payload"].apply(lambda p: p.get(key) if isinstance(p, dict) else None)
+
+
+def numeric(df: pd.DataFrame, column: str) -> pd.Series:
+    """Cột số an toàn: trả Series rỗng khi thiếu cột hoặc DataFrame rỗng."""
+    if df.empty or column not in df.columns:
+        return pd.Series(dtype="float64")
+    return pd.to_numeric(df[column], errors="coerce").dropna()
+
+
+def compute_metrics(df: pd.DataFrame) -> dict:
+    """Tính đúng 6 nhóm chỉ số của contract từ một cửa sổ dữ liệu."""
+    responses = event_subset(df, "response_sent")
+    received = event_subset(df, "request_received")
+    failed = event_subset(df, "request_failed")
+
+    latency = numeric(responses, "latency_ms")
+    cost = numeric(responses, "cost_usd")
+    quality = numeric(responses, "quality_score")
+
     return {
-        "timestamp": datetime.now().isoformat(),
-        "time_range_min": time_range_min,
-        "latency_p50": response_df["latency_ms"].quantile(0.50) if "latency_ms" in response_df else 0,
-        "latency_p95": response_df["latency_ms"].quantile(0.95) if "latency_ms" in response_df else 0,
-        "latency_p99": response_df["latency_ms"].quantile(0.99) if "latency_ms" in response_df else 0,
-        "error_rate_pct": len(failed_df) / len(received_df) * 100 if len(received_df) > 0 else 0,
-        "total_cost_usd": response_df["cost_usd"].sum() if "cost_usd" in response_df else 0,
-        "tokens_in_total": response_df["tokens_in"].sum() if "tokens_in" in response_df else 0,
-        "tokens_out_total": response_df["tokens_out"].sum() if "tokens_out" in response_df else 0,
-        "quality_score_avg": response_df["quality_score"].mean() if "quality_score" in response_df else 0,
-        "total_requests": len(received_df),
-        "total_failures": len(failed_df),
+        "responses": responses,
+        "received": received,
+        "failed": failed,
+        "count_received": len(received),
+        "count_responses": len(responses),
+        "count_failed": len(failed),
+        "latency_p50": float(latency.quantile(0.50)) if not latency.empty else 0.0,
+        "latency_p95": float(latency.quantile(0.95)) if not latency.empty else 0.0,
+        "latency_p99": float(latency.quantile(0.99)) if not latency.empty else 0.0,
+        "latency_max": float(latency.max()) if not latency.empty else 0.0,
+        "error_rate_pct": (len(failed) / len(received) * 100) if len(received) else 0.0,
+        "total_cost_usd": float(cost.sum()) if not cost.empty else 0.0,
+        "avg_cost_usd": float(cost.mean()) if not cost.empty else 0.0,
+        "tokens_in": int(numeric(responses, "tokens_in").sum()),
+        "tokens_out": int(numeric(responses, "tokens_out").sum()),
+        "quality_avg": float(quality.mean()) if not quality.empty else 0.0,
+        "quality_min": float(quality.min()) if not quality.empty else 0.0,
     }
 
 
-def add_threshold_lines(fig: go.Figure, threshold: float, orientation: str = "v", 
-                        name: str = "SLO Threshold", color: str = "#f85149") -> go.Figure:
-    """
-    Add dashed threshold line to Plotly figure.
-    
-    Args:
-        fig: Plotly figure object
-        threshold: Threshold value to mark
-        orientation: 'v' for vertical, 'h' for horizontal
-        name: Label for the line
-        color: Line color
-    """
-    if orientation == "h":
-        fig.add_hline(
-            y=threshold,
-            line_dash="dash",
-            line_color=color,
-            annotation_text=name,
-            annotation_position="top"
+def unique_correlation_ids(df: pd.DataFrame) -> list[str]:
+    if df.empty or "correlation_id" not in df.columns:
+        return []
+    ids = df["correlation_id"].dropna()
+    ids = ids[ids != "MISSING"]
+    return sorted(ids.unique().tolist())
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# VALIDATORS — chạy đúng script chấm điểm, không mô phỏng lại
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@st.cache_data(ttl=CONTRACT_REFRESH_S, show_spinner=False)
+def run_script(rel_path: str, args: tuple[str, ...] = ()) -> tuple[int, str]:
+    """Chạy một script trong repo và trả (exit code, output hợp nhất stdout+stderr)."""
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(REPO_ROOT / rel_path), *args],
+            cwd=str(REPO_ROOT),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=180,
         )
-    else:
-        fig.add_vline(
-            x=threshold,
-            line_dash="dash",
-            line_color=color,
-            annotation_text=name,
-            annotation_position="top"
+    except Exception as exc:  # script lỗi không được làm sập dashboard giữa lúc demo
+        return 1, f"Không chạy được {rel_path}: {type(exc).__name__}: {exc}"
+    return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+
+
+@st.cache_data(ttl=CONTRACT_REFRESH_S, show_spinner=False)
+def run_pytest() -> tuple[int, str]:
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-m", "pytest", "-q"],
+            cwd=str(REPO_ROOT),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=300,
         )
+    except Exception as exc:
+        return 1, f"Không chạy được pytest: {type(exc).__name__}: {exc}"
+    return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+
+
+def parse_log_score(output: str) -> int | None:
+    match = re.search(r"Estimated Score:\s*(\d+)\s*/\s*100", output)
+    return int(match.group(1)) if match else None
+
+
+def parse_panel_count(output: str) -> int | None:
+    match = re.search(r"(\d+)\s*/\s*6\s*panel", output)
+    return int(match.group(1)) if match else None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# INCIDENT DETECTION — dựng cửa sổ baseline vs incident từ chính log
+# ═══════════════════════════════════════════════════════════════════════════════
+
+INCIDENT_KB = {
+    "rag_slow": {
+        "panel": "latency",
+        "signal": "P95 latency tăng vọt trong khi traffic và error rate gần như không đổi.",
+        "root_cause": (
+            "`app/mock_rag.py::retrieve()` chèn `time.sleep(2.5)` mỗi lần gọi khi "
+            "`STATE['rag_slow'] = True` — toàn bộ luồng agent bị giữ lại ở bước retrieval."
+        ),
+        "fix": [
+            "Tắt incident ngay: `POST /incidents/rag_slow/disable`.",
+            "Đặt timeout cho `retrieve()` và trả fallback khi quá hạn.",
+            "Bọc retrieval bằng circuit breaker để không kéo theo cả request.",
+        ],
+        "prevent": [
+            "Alert `high_latency_p95` (P95 > 3000ms trong 5m) đã có trong `config/alert_rules.yaml`.",
+            "Synthetic health check định kỳ riêng cho RAG retrieval.",
+            "Giữ span riêng `as_type=\"retriever\"` để khoanh vùng nghẽn trong một lần mở trace.",
+        ],
+    },
+    "tool_fail": {
+        "panel": "errors",
+        "signal": "Error rate vượt SLO, `error_type` dồn vào một loại lỗi duy nhất.",
+        "root_cause": (
+            "`app/mock_rag.py::retrieve()` raise `RuntimeError(\"Vector store timeout\")` khi "
+            "`STATE['tool_fail'] = True` — request fail trước khi kịp gọi LLM."
+        ),
+        "fix": [
+            "Tắt incident: `POST /incidents/tool_fail/disable`.",
+            "Thêm retry có backoff cho tool call, giới hạn số lần thử.",
+            "Trả degraded answer thay vì 500 khi vector store không phản hồi.",
+        ],
+        "prevent": [
+            "Alert `elevated_error_rate` (error rate > 2% trong 3m).",
+            "Dependency health check cho vector store trước khi nhận traffic.",
+            "Gắn `error_type` vào log để breakdown chỉ ra ngay tool nào hỏng.",
+        ],
+    },
+    "cost_spike": {
+        "panel": "cost",
+        "signal": "Cost và tokens_out tăng đột biến, latency gần như giữ nguyên.",
+        "root_cause": (
+            "`app/mock_llm.py::generate()` nhân `output_tokens *= 4` khi "
+            "`STATE['cost_spike'] = True` — mỗi response tốn gấp bốn lần token đầu ra."
+        ),
+        "fix": [
+            "Tắt incident: `POST /incidents/cost_spike/disable`.",
+            "Áp `max_tokens` cho response và cắt ngữ cảnh thừa.",
+            "Chặn theo budget khi cost tích luỹ chạm ngưỡng ngày.",
+        ],
+        "prevent": [
+            "Alert `cost_budget_exceeded` (cost 24h > 2.5 USD trong 5m).",
+            "Theo dõi cost/request thay vì chỉ tổng cost để bắt sớm bất thường.",
+            "Cảnh báo khi tỉ lệ tokens_out/tokens_in lệch khỏi baseline.",
+        ],
+    },
+}
+
+
+def incident_windows(df: pd.DataFrame) -> list[dict]:
+    """
+    Ghép cặp incident_enabled -> incident_disabled thành các cửa sổ thời gian.
+
+    Cửa sổ chưa đóng (chỉ có enable) kéo tới bản ghi cuối cùng — đúng với trạng
+    thái "incident vẫn đang bật" khi nhóm demo trực tiếp.
+    """
+    if df.empty or "event" not in df.columns or "ts" not in df.columns:
+        return []
+
+    control = df[df["event"].isin(["incident_enabled", "incident_disabled"])].copy()
+    if control.empty:
+        return []
+    control["name"] = payload_field(control, "name")
+    last_ts = df["ts"].max()
+
+    windows: list[dict] = []
+    open_by_name: dict[str, pd.Timestamp] = {}
+    for _, row in control.sort_values("ts").iterrows():
+        name, ts = row["name"], row["ts"]
+        if not name or pd.isna(ts):
+            continue
+        if row["event"] == "incident_enabled":
+            open_by_name.setdefault(name, ts)
+        else:
+            start = open_by_name.pop(name, None)
+            if start is not None:
+                windows.append({"name": name, "start": start, "end": ts, "closed": True})
+    for name, start in open_by_name.items():
+        windows.append({"name": name, "start": start, "end": last_ts, "closed": False})
+
+    return sorted(windows, key=lambda w: w["start"])
+
+
+def split_by_incident(df: pd.DataFrame, windows: list[dict]) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Tách dữ liệu thành (baseline, trong incident) để so sánh trực tiếp."""
+    if df.empty or "ts" not in df.columns or not windows:
+        return df, pd.DataFrame()
+    inside = pd.Series(False, index=df.index)
+    for window in windows:
+        inside |= (df["ts"] >= window["start"]) & (df["ts"] <= window["end"])
+    return df[~inside], df[inside]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CHART HELPERS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def style_figure(fig: go.Figure, height: int = 270, ytitle: str = "") -> go.Figure:
+    fig.update_layout(
+        template="plotly_dark",
+        height=height,
+        margin=dict(l=10, r=10, t=30, b=10),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        legend=dict(orientation="h", yanchor="bottom", y=1.0, xanchor="right", x=1),
+        hovermode="x unified",
+        yaxis_title=ytitle,
+        font=dict(size=12),
+    )
     return fig
 
 
-def get_sparkline_data(series: pd.Series, bins: int = 20) -> list:
-    """
-    Generate sparkline data from time series.
-    
-    Args:
-        series: Time series data
-        bins: Number of buckets to aggregate
-        
-    Returns:
-        list: Normalized values for sparkline rendering
-    """
-    if series.empty:
-        return [0] * bins
-    
-    # Downsample to bins
-    if len(series) > bins:
-        indices = np.linspace(0, len(series) - 1, bins).astype(int)
-        return series.iloc[indices].tolist()
-    return series.tolist() + [0] * (bins - len(series))
+def threshold_line(fig: go.Figure, value: float, text: str, color: str = C_RED) -> None:
+    fig.add_hline(y=value, line_dash="dash", line_color=color, annotation_text=text,
+                  annotation_position="top left", annotation_font_color=color)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# HEADER - Title & Alert Banner
-# ═══════════════════════════════════════════════════════════════════════════════
+def mark_incidents(fig: go.Figure, windows: list[dict]) -> None:
+    """Tô vùng thời gian có incident lên mọi biểu đồ theo thời gian."""
+    for window in windows:
+        fig.add_vrect(
+            x0=window["start"], x1=window["end"],
+            fillcolor=C_RED, opacity=0.13, line_width=0,
+            annotation_text=window["name"], annotation_position="top left",
+            annotation_font_color=C_RED, annotation_font_size=10,
+        )
 
-col_title, col_status = st.columns([3, 1])
 
-with col_title:
-    st.markdown("""
-    <div style="padding: 1rem 0;">
-        <h1 style="margin: 0; color: var(--text-primary);">
-            📊 Day 13 AI Observability
-        </h1>
-        <p style="margin: 0.5rem 0 0 0; color: var(--text-secondary);">
-            Real-time monitoring dashboard • Service: day13-observability-lab
-        </p>
+def verdict_html(ok: bool, ok_text: str, bad_text: str) -> str:
+    css = "verdict-ok" if ok else "verdict-bad"
+    return f'<span class="{css}">{ok_text if ok else bad_text}</span>'
+
+
+def gate_card(label: str, value: str, desc: str, passed: bool) -> str:
+    color = C_GREEN if passed else C_RED
+    icon = "✅ ĐẠT" if passed else "❌ CHƯA ĐẠT"
+    return f"""
+    <div class="gate {'pass' if passed else 'fail'}">
+        <div class="label">{label}</div>
+        <div class="big" style="color:{color};">{value}</div>
+        <div class="desc">{desc}</div>
+        <div style="margin-top:9px;font-size:12.5px;font-weight:800;color:{color};">{icon}</div>
     </div>
-    """, unsafe_allow_html=True)
+    """
 
-with col_status:
-    # Live indicator
-    if auto_refresh:
-        st.markdown(f"""
-        <div style="text-align: right; padding: 1rem;">
-            <span style="display: inline-flex; align-items: center; gap: 8px;">
-                <span style="width: 12px; height: 12px; background: var(--accent-green); 
-                      border-radius: 50%; animation: pulse 1.5s infinite;"></span>
-                <span style="color: var(--accent-green); font-weight: 600;">LIVE</span>
-            </span>
-            <br>
-            <span style="color: var(--text-secondary); font-size: 0.8rem;">
-                Updated: {datetime.now().strftime('%H:%M:%S')}
-            </span>
-        </div>
-        """, unsafe_allow_html=True)
 
-st.divider()
+def step_card(step_no: str, title: str, body: str) -> str:
+    return f"""
+    <div class="step">
+        <small>Bước {step_no}</small>
+        <div class="title">{title}</div>
+        <div class="body">{body}</div>
+    </div>
+    """
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ALERT BANNER - Active Breaches
+# LOAD DATA
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# Calculate current metrics
-response_df = df[df["event"] == "response_sent"] if "event" in df.columns and not df.empty else pd.DataFrame()
-failed_df = df[df["event"] == "request_failed"] if "event" in df.columns and not df.empty else pd.DataFrame()
-received_df = df[df["event"] == "request_received"] if "event" in df.columns and not df.empty else pd.DataFrame()
+df_all, raw_lines, malformed_lines = load_logs()
 
-current_metrics = {
-    "latency_p95_ms": response_df["latency_ms"].quantile(0.95) if "latency_ms" in response_df else 0,
-    "error_rate_pct": len(failed_df) / len(received_df) * 100 if len(received_df) > 0 else 0,
-    "daily_cost_usd": response_df["cost_usd"].sum() if "cost_usd" in response_df else 0,
-    "quality_score_avg": response_df["quality_score"].mean() if "quality_score" in response_df else 0,
-}
+# ═══════════════════════════════════════════════════════════════════════════════
+# SIDEBAR
+# ═══════════════════════════════════════════════════════════════════════════════
 
-# Check for breaches (include incident mode simulation)
-active_alerts = []
-for metric, value in current_metrics.items():
-    target = SLO.get(metric, 0)
-    if metric in ["latency_p95_ms", "error_rate_pct", "daily_cost_usd"]:
-        if value > target or st.session_state.incident_mode:
-            active_alerts.append(metric)
-    elif metric == "quality_score_avg":
-        if value < target:
-            active_alerts.append(metric)
+with st.sidebar:
+    st.markdown("## 🎬 Kịch bản demo")
+    view = st.radio("Phần đang trình bày", VIEWS, index=0, label_visibility="collapsed")
 
-# Simulate incident alert
-if st.session_state.incident_mode and "error_rate_pct" not in active_alerts:
-    active_alerts.append("error_rate_pct")
+    st.divider()
+    st.markdown("### 🕒 Cửa sổ dữ liệu")
 
-if active_alerts:
-    alert_colors = {"error_rate_pct": "#f85149", "latency_p95_ms": "#d29922", "daily_cost_usd": "#d29922"}
-    alert_msgs = {
-        "error_rate_pct": "Error rate above SLO threshold",
-        "latency_p95_ms": "P95 latency exceeds 3000ms",
-        "daily_cost_usd": "Daily cost budget exceeded",
+    range_options = {
+        f"{CONTRACT_RANGE_MIN} phút (contract)": CONTRACT_RANGE_MIN,
+        "30 phút": 30,
+        "2 giờ": 120,
+        "24 giờ": 1440,
+        "Toàn bộ dữ liệu": None,
     }
-    
-    for alert in active_alerts[:3]:  # Show max 3 alerts
-        color = alert_colors.get(alert, "#f85149")
-        st.markdown(f"""
-        <div class="alert-banner" style="border-color: {color}; background: linear-gradient(90deg, {color}22 0%, transparent 100%);">
-            <span style="font-size: 1.5rem;">🚨</span>
-            <div>
-                <strong style="color: {color};">{alert_msgs.get(alert, alert)}</strong><br>
-                <span style="color: var(--text-secondary); font-size: 0.85rem;">
-                    {ALERT_RULES[0]['summary'] if ALERT_RULES else 'Check metrics immediately'}
-                </span>
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
+    range_label = st.selectbox("Khoảng thời gian", list(range_options), index=0)
+    range_minutes = range_options[range_label]
+
+    anchor_to_data = st.toggle(
+        "Neo theo log mới nhất",
+        value=True,
+        help=(
+            "Bật: cửa sổ tính lùi từ bản ghi log mới nhất — demo không bị trống khi log "
+            "được sinh từ trước. Tắt: tính lùi từ đồng hồ thực."
+        ),
+    )
+
+    st.divider()
+    st.markdown("### 🔄 Làm mới")
+    st.caption(f"Cache dữ liệu {CONTRACT_REFRESH_S}s theo contract.")
+    if st.button("Làm mới ngay", width="stretch"):
+        st.cache_data.clear()
+        st.rerun()
+
+    st.divider()
+    st.markdown("### 📌 Contract")
+    st.caption(
+        f"Nguồn: `data/logs.jsonl`\n\n"
+        f"Panels: {len(PANELS)}/6 · Range: {CONTRACT_RANGE_MIN}m · Refresh: {CONTRACT_REFRESH_S}s"
+    )
+    langfuse_host = os.getenv("LANGFUSE_HOST", "https://cloud.langfuse.com")
+    st.caption(f"Langfuse: {langfuse_host}")
+
+# ─── Áp cửa sổ thời gian ──────────────────────────────────────────────────────
+
+if df_all.empty or "ts" not in df_all.columns:
+    df_window = df_all
+    anchor_ts = None
+    cutoff_ts = None
 else:
-    st.markdown("""
-    <div class="alert-banner" style="border-color: var(--accent-green); background: linear-gradient(90deg, rgba(63, 185, 80, 0.1) 0%, transparent 100%);">
-        <span style="font-size: 1.5rem;">✅</span>
-        <div>
-            <strong style="color: var(--accent-green);">All SLOs Healthy</strong><br>
-            <span style="color: var(--text-secondary); font-size: 0.85rem;">
-                No active alerts • Service operating within targets
-            </span>
-        </div>
+    anchor_ts = df_all["ts"].max() if anchor_to_data else pd.Timestamp.now(tz="UTC")
+    if range_minutes is None:
+        df_window = df_all
+        cutoff_ts = df_all["ts"].min()
+    else:
+        cutoff_ts = anchor_ts - pd.Timedelta(minutes=range_minutes)
+        df_window = df_all[df_all["ts"] >= cutoff_ts].copy()
+
+metrics = compute_metrics(df_window)
+windows_all = incident_windows(df_all)
+windows_view = [w for w in windows_all if cutoff_ts is None or w["end"] >= cutoff_ts]
+trace_ids_all = unique_correlation_ids(df_all)
+
+# ─── Kết quả validator (chạy thật) ────────────────────────────────────────────
+
+log_rc, log_out = run_script("scripts/validate_logs.py")
+dash_rc, dash_out = run_script("scripts/validate_dashboard.py")
+log_score = parse_log_score(log_out)
+panel_count = parse_panel_count(dash_out)
+
+pass_logs = log_score is not None and log_score >= PASS_LOG_SCORE
+pass_panels = panel_count == PASS_PANEL_COUNT and dash_rc == 0
+pass_traces = len(trace_ids_all) >= PASS_TRACE_COUNT
+demo_ready = pass_logs and pass_panels and pass_traces
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# HEADER + CONTEXT BAR (luôn hiển thị — ảnh evidence phải đọc được các thông số này)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+head_left, head_right = st.columns([3, 1])
+with head_left:
+    st.markdown(
+        f"# 📊 {CONTRACT.get('title', 'Day 13 AI Observability')}"
+        f"\n<div class='lede'>Observe → Explain → Fix → Prevent · service "
+        f"<code>{os.getenv('APP_NAME', 'day13-observability-lab')}</code></div>",
+        unsafe_allow_html=True,
+    )
+with head_right:
+    color = C_GREEN if demo_ready else C_YELLOW
+    text = "DEMO SẴN SÀNG" if demo_ready else "CHƯA ĐỦ ĐIỀU KIỆN"
+    st.markdown(
+        f"<div style='text-align:right;padding-top:18px;'>"
+        f"<span style='color:{color};font-weight:900;font-size:15px;'>{text}</span><br>"
+        f"<span style='color:{C_MUTED};font-size:12px;'>Cập nhật {datetime.now().strftime('%H:%M:%S')}</span>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+anchor_text = (
+    f"{anchor_ts.strftime('%Y-%m-%d %H:%M:%SZ')}" if anchor_ts is not None else "—"
+)
+st.markdown(
+    f"""
+    <div class="ctx-bar">
+        <span class="chip">Nguồn <b>data/logs.jsonl</b></span>
+        <span class="chip">Time range <b>{range_label}</b></span>
+        <span class="chip">Neo <b>{'log mới nhất' if anchor_to_data else 'đồng hồ thực'}</b> · {anchor_text}</span>
+        <span class="chip">Refresh <b>{CONTRACT_REFRESH_S}s</b></span>
+        <span class="chip">Bản ghi <b>{len(df_window)}</b>/{len(df_all)}</span>
+        <span class="chip">Traces <b>{len(trace_ids_all)}</b></span>
+        <span class="chip">SLO P95 <b>≤ {SLO.get('latency_p95_ms', 3000):.0f}ms</b></span>
+        <span class="chip">SLO error <b>≤ {SLO.get('error_rate_pct', 2):.0f}%</b></span>
     </div>
-    """, unsafe_allow_html=True)
+    """,
+    unsafe_allow_html=True,
+)
 
-st.divider()
+if df_all.empty:
+    st.error(
+        "Chưa có dữ liệu trong `data/logs.jsonl`. Chạy API rồi sinh log:\n\n"
+        "```\nuvicorn app.main:app --reload\npython scripts/load_test.py --concurrency 5\n```"
+    )
+    st.stop()
+
+if df_window.empty:
+    st.warning(
+        "Cửa sổ thời gian đang chọn không có bản ghi nào. Bật **Neo theo log mới nhất** "
+        "hoặc chọn **Toàn bộ dữ liệu** trong sidebar."
+    )
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SLO STATUS ROW - 4 Cards
+# GATE — ĐIỀU KIỆN "DEMO ĐẠT" (3 checkpoint cuối của kịch bản)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-st.markdown("### 📈 Service Level Objectives")
-slo_cols = st.columns(4)
 
-slo_data = [
-    {
-        "id": "latency",
-        "title": "Latency P95",
-        "value": current_metrics.get("latency_p95_ms", 0),
-        "unit": "ms",
-        "target": SLO.get("latency_p95_ms", 3000),
-        "format": lambda v: f"{v:.0f}",
-        "lower_is_better": True,
-        "icon": "⏱️",
-    },
-    {
-        "id": "errors",
-        "title": "Error Rate",
-        "value": current_metrics.get("error_rate_pct", 0),
-        "unit": "%",
-        "target": SLO.get("error_rate_pct", 2),
-        "format": lambda v: f"{v:.2f}",
-        "lower_is_better": True,
-        "icon": "❌",
-    },
-    {
-        "id": "cost",
-        "title": "Daily Cost",
-        "value": current_metrics.get("daily_cost_usd", 0),
-        "unit": "USD",
-        "target": SLO.get("daily_cost_usd", 2.5),
-        "format": lambda v: f"${v:.4f}",
-        "lower_is_better": True,
-        "icon": "💰",
-    },
-    {
-        "id": "quality",
-        "title": "Quality Score",
-        "value": current_metrics.get("quality_score_avg", 0),
-        "unit": "",
-        "target": SLO.get("quality_score_avg", 0.75),
-        "format": lambda v: f"{v:.3f}",
-        "lower_is_better": False,
-        "icon": "⭐",
-    },
-]
-
-for i, slo in enumerate(slo_data):
-    with slo_cols[i]:
-        status, css_class, is_breach = get_slo_status(
-            slo["value"], slo["target"], slo["lower_is_better"]
+def render_gate() -> None:
+    st.markdown("### 🎯 Điều kiện “demo đạt”")
+    st.markdown(
+        "<div class='lede'>Ba checkpoint tự xác nhận trước khi lên trình bày — "
+        "số liệu lấy trực tiếp từ validator, không nhập tay.</div>",
+        unsafe_allow_html=True,
+    )
+    gate_cols = st.columns(3)
+    with gate_cols[0]:
+        st.markdown(
+            gate_card(
+                "Logging validation",
+                f"{log_score if log_score is not None else '—'}/100",
+                f"<code>validate_logs.py</code> · yêu cầu ≥ {PASS_LOG_SCORE}/100",
+                pass_logs,
+            ),
+            unsafe_allow_html=True,
         )
-        
-        # Inject incident simulation for error rate
-        display_value = slo["value"]
-        if st.session_state.incident_mode and slo["id"] == "errors":
-            display_value = 5.2  # Simulated breach
-        
-        st.markdown(f"""
-        <div class="panel-card">
-            <div style="display: flex; justify-content: space-between; align-items: flex-start;">
-                <div>
-                    <span style="font-size: 1.2rem;">{slo['icon']}</span>
-                    <span style="color: var(--text-secondary); font-size: 0.85rem;">{slo['title']}</span>
-                </div>
-                <span class="{css_class}" style="font-size: 0.75rem; padding: 2px 8px; 
-                      background: {'rgba(248,81,73,0.2)' if is_breach else 'rgba(63,185,80,0.2)'}; 
-                      border-radius: 4px;">
-                    {status}
-                </span>
-            </div>
-            <div style="font-size: 2rem; font-weight: 700; margin: 0.5rem 0; color: var(--text-primary);">
-                {slo['format'](display_value)}<span style="font-size: 0.9rem; color: var(--text-secondary);">{slo['unit']}</span>
-            </div>
-            <div style="color: var(--text-secondary); font-size: 0.8rem;">
-                Target: {slo['format'](slo['target'])}{slo['unit']}
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
+    with gate_cols[1]:
+        st.markdown(
+            gate_card(
+                "Dashboard validation",
+                f"{panel_count if panel_count is not None else '—'} / 6",
+                "Đủ latency · traffic · error · cost · token · quality",
+                pass_panels,
+            ),
+            unsafe_allow_html=True,
+        )
+    with gate_cols[2]:
+        st.markdown(
+            gate_card(
+                "Tracing evidence",
+                f"{len(trace_ids_all)}",
+                f"Correlation ID duy nhất trong log · yêu cầu ≥ {PASS_TRACE_COUNT}",
+                pass_traces,
+            ),
+            unsafe_allow_html=True,
+        )
 
-st.divider()
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# PANEL 1: LATENCY PERCENTILES
+# 6 PANEL THEO CONTRACT
 # ═══════════════════════════════════════════════════════════════════════════════
 
-st.markdown("""
-<div class="panel-header">
-    <span>⏱️</span> 1. Latency Percentiles
-    <span style="margin-left: auto; font-size: 0.8rem; color: var(--text-secondary);">
-        P50 / P95 / P99 distribution
-    </span>
-</div>
-""", unsafe_allow_html=True)
 
-lat_col1, lat_col2 = st.columns([1, 2])
+def panel_latency(container, data: dict, windows: list[dict]) -> None:
+    with container:
+        p95 = data["latency_p95"]
+        target = SLO.get("latency_p95_ms", 3000)
+        breach = p95 > target
+        panel_header("latency", "Latency percentiles",
+                     verdict_html(not breach, "P95 trong ngưỡng", "P95 vượt SLO"))
 
-with lat_col1:
-    if not response_df.empty and "latency_ms" in response_df.columns:
-        p50 = response_df["latency_ms"].quantile(0.50)
-        p95 = response_df["latency_ms"].quantile(0.95)
-        p99 = response_df["latency_ms"].quantile(0.99)
-        
-        st.markdown(f"""
-        <div class="metric-card">
-            <div style="color: var(--accent-blue); font-weight: 600;">P50</div>
-            <div style="font-size: 1.8rem; font-weight: 700;">{p50:.0f} <span style="font-size: 0.9rem; color: var(--text-secondary);">ms</span></div>
-        </div>
-        """, unsafe_allow_html=True)
-        
-        p95_status = "status-breach" if p95 > SLO["latency_p95_ms"] else "status-ok"
-        st.markdown(f"""
-        <div class="metric-card">
-            <div style="color: var(--accent-purple); font-weight: 600;">P95 <span class="{p95_status}">{'⚠️' if p95 > SLO["latency_p95_ms"] else '✓'}</span></div>
-            <div style="font-size: 1.8rem; font-weight: 700;">{p95:.0f} <span style="font-size: 0.9rem; color: var(--text-secondary);">ms</span></div>
-        </div>
-        """, unsafe_allow_html=True)
-        
-        st.markdown(f"""
-        <div class="metric-card">
-            <div style="color: var(--accent-yellow); font-weight: 600;">P99</div>
-            <div style="font-size: 1.8rem; font-weight: 700;">{p99:.0f} <span style="font-size: 0.9rem; color: var(--text-secondary);">ms</span></div>
-        </div>
-        """, unsafe_allow_html=True)
-    else:
-        st.info("No latency data available")
+        cols = st.columns(3)
+        cols[0].metric("P50", f"{data['latency_p50']:.0f} ms")
+        cols[1].metric("P95", f"{p95:.0f} ms", f"{p95 - target:+.0f} ms so với SLO",
+                       delta_color="inverse")
+        cols[2].metric("P99", f"{data['latency_p99']:.0f} ms")
 
-with lat_col2:
-    if not response_df.empty and "latency_ms" in response_df.columns:
-        # Multi-line chart: latency over time with percentiles
-        response_with_ts = response_df.copy()
-        if "ts" in response_with_ts.columns:
-            response_with_ts = response_with_ts.set_index("ts")
-            latency_by_time = response_with_ts["latency_ms"].resample("1min").agg(
-                ["min", lambda x: x.quantile(0.50), lambda x: x.quantile(0.95), lambda x: x.quantile(0.99), "max"]
-            ).reset_index()
-            latency_by_time.columns = ["time", "min", "p50", "p95", "p99", "max"]
-            
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(
-                x=latency_by_time["time"], y=latency_by_time["p50"],
-                name="P50", line=dict(color="#58a6ff", width=2), mode="lines"
-            ))
-            fig.add_trace(go.Scatter(
-                x=latency_by_time["time"], y=latency_by_time["p95"],
-                name="P95", line=dict(color="#a371f7", width=2), mode="lines"
-            ))
-            fig.add_trace(go.Scatter(
-                x=latency_by_time["time"], y=latency_by_time["p99"],
-                name="P99", line=dict(color="#d29922", width=2), mode="lines"
-            ))
-            
-            # Add threshold line
-            fig.add_hline(
-                y=SLO["latency_p95_ms"],
-                line_dash="dash",
-                line_color="#f85149",
-                annotation_text=f"SLO: {SLO['latency_p95_ms']}ms"
-            )
-            
-            fig.update_layout(
-                template="plotly_dark",
-                height=300,
-                margin=dict(l=20, r=20, t=40, b=20),
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-                hovermode="x unified",
-            )
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            # Histogram fallback
-            fig = px.histogram(
-                response_df, x="latency_ms", nbins=30,
-                title="Latency Distribution",
-                color_discrete_sequence=["#58a6ff"]
-            )
-            fig.add_vline(x=SLO["latency_p95_ms"], line_dash="dash", line_color="#f85149")
-            fig.update_layout(template="plotly_dark", height=300)
-            st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("No latency data for chart")
+        responses = data["responses"]
+        if responses.empty or "ts" not in responses.columns:
+            st.caption("Chưa có `response_sent` để vẽ latency.")
+            return
 
-st.divider()
+        series = responses.set_index("ts")["latency_ms"].astype(float)
+        by_min = series.resample("1min")
+        frame = pd.DataFrame(
+            {
+                "p50": by_min.quantile(0.50),
+                "p95": by_min.quantile(0.95),
+                "p99": by_min.quantile(0.99),
+            }
+        ).dropna(how="all").reset_index()
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# PANEL 2: REQUEST TRAFFIC
-# ═══════════════════════════════════════════════════════════════════════════════
-
-st.markdown("""
-<div class="panel-header">
-    <span>📨</span> 2. Request Traffic
-    <span style="margin-left: auto; font-size: 0.8rem; color: var(--text-secondary);">
-        Request count and rate analysis
-    </span>
-</div>
-""", unsafe_allow_html=True)
-
-traffic_col1, traffic_col2 = st.columns([1, 2])
-
-with traffic_col1:
-    total_requests = len(received_df)
-    rate_per_min = total_requests / time_range_min if time_range_min > 0 else 0
-    success_count = len(response_df)
-    success_rate = (success_count / total_requests * 100) if total_requests > 0 else 0
-    
-    st.markdown(f"""
-    <div class="metric-card">
-        <div style="color: var(--accent-blue); font-weight: 600;">Total Requests</div>
-        <div style="font-size: 1.8rem; font-weight: 700;">{total_requests:,}</div>
-        <div style="color: var(--text-secondary); font-size: 0.85rem; margin-top: 0.25rem;">
-            in {time_range_min} min window
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    st.markdown(f"""
-    <div class="metric-card">
-        <div style="color: var(--accent-green); font-weight: 600;">Rate</div>
-        <div style="font-size: 1.8rem; font-weight: 700;">{rate_per_min:.1f} <span style="font-size: 0.9rem; color: var(--text-secondary);">req/min</span></div>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    st.markdown(f"""
-    <div class="metric-card">
-        <div style="color: var(--accent-purple); font-weight: 600;">Success Rate</div>
-        <div style="font-size: 1.8rem; font-weight: 700;">{success_rate:.1f}<span style="font-size: 0.9rem; color: var(--text-secondary);">%</span></div>
-        <div style="color: var(--text-secondary); font-size: 0.85rem; margin-top: 0.25rem;">
-            {success_count} successful
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-with traffic_col2:
-    if not received_df.empty and "ts" in received_df.columns:
-        # Multi-series traffic chart
-        received_ts = received_df.set_index("ts")
-        traffic_by_time = received_ts.resample("1min").size().reset_index(name="requests")
-        
         fig = go.Figure()
-        fig.add_trace(go.Bar(
-            x=traffic_by_time["ts"], y=traffic_by_time["requests"],
-            name="Requests", marker_color="#58a6ff", opacity=0.7
-        ))
-        fig.add_trace(go.Scatter(
-            x=traffic_by_time["ts"], y=traffic_by_time["requests"].rolling(5, min_periods=1).mean(),
-            name="5-min Avg", line=dict(color="#f85149", width=2)
-        ))
-        
-        fig.update_layout(
-            template="plotly_dark",
-            height=300,
-            margin=dict(l=20, r=20, t=40, b=20),
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-            hovermode="x unified",
-            yaxis_title="Requests / min"
-        )
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("No traffic data available")
+        for name, color in (("p50", C_BLUE), ("p95", C_VIOLET), ("p99", C_YELLOW)):
+            fig.add_trace(go.Scatter(x=frame["ts"], y=frame[name], name=name.upper(),
+                                     mode="lines+markers", line=dict(color=color, width=2)))
+        threshold_line(fig, target, f"SLO P95 ≤ {target:.0f}ms")
+        mark_incidents(fig, windows)
+        st.plotly_chart(style_figure(fig, ytitle="ms"), width="stretch")
 
-st.divider()
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# PANEL 3: ERROR RATE & BREAKDOWN
-# ═══════════════════════════════════════════════════════════════════════════════
+def panel_traffic(container, data: dict, windows: list[dict]) -> None:
+    with container:
+        received = data["received"]
+        span_min = max(range_minutes or CONTRACT_RANGE_MIN, 1)
+        rate = data["count_received"] / span_min
+        panel_header("traffic", "Request traffic")
 
-st.markdown("""
-<div class="panel-header">
-    <span>❌</span> 3. Error Rate
-    <span style="margin-left: auto; font-size: 0.8rem; color: var(--text-secondary);">
-        error_rate_pct = (count request_failed / count request_received) * 100
-    </span>
-</div>
-""", unsafe_allow_html=True)
+        cols = st.columns(3)
+        cols[0].metric("Requests", f"{data['count_received']:,}")
+        cols[1].metric("Rate", f"{rate:.2f} req/min")
+        success = (data["count_responses"] / data["count_received"] * 100) if data["count_received"] else 0.0
+        cols[2].metric("Success rate", f"{success:.1f} %")
 
-error_col1, error_col2 = st.columns([1, 2])
+        if received.empty or "ts" not in received.columns:
+            st.caption("Chưa có `request_received` để vẽ traffic.")
+            return
 
-with error_col1:
-    total_failed = len(failed_df)
-    total_received = len(received_df)
-    error_rate = total_failed / total_received * 100 if total_received > 0 else 0
-    
-    # Simulate incident mode
-    if st.session_state.incident_mode:
-        error_rate = 5.2
-        total_failed = 26
-    
-    error_status, _, is_breach = get_slo_status(error_rate, SLO["error_rate_pct"], True)
-    
-    st.markdown(f"""
-    <div class="metric-card" style="{'border-color: var(--accent-red);' if is_breach else ''}">
-        <div style="color: var(--accent-red); font-weight: 600;">Error Rate</div>
-        <div style="font-size: 2rem; font-weight: 700; color: {'var(--accent-red)' if is_breach else 'var(--text-primary)'};">
-            {error_rate:.2f}<span style="font-size: 0.9rem; color: var(--text-secondary);">%</span>
-        </div>
-        <div style="color: {('var(--accent-red)' if is_breach else 'var(--accent-green)')}; font-size: 0.85rem; margin-top: 0.25rem;">
-            {error_status} • SLO: {SLO["error_rate_pct"]}%
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    st.markdown(f"""
-    <div class="metric-card">
-        <div style="color: var(--text-secondary); font-weight: 600;">Failed Requests</div>
-        <div style="font-size: 1.5rem; font-weight: 700;">{total_failed:,}</div>
-        <div style="color: var(--text-secondary); font-size: 0.85rem; margin-top: 0.25rem;">
-            of {total_received:,} total
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-with error_col2:
-    if not failed_df.empty and "error_type" in failed_df.columns:
-        # Error breakdown pie chart
-        error_counts = failed_df["error_type"].value_counts().reset_index()
-        error_counts.columns = ["error_type", "count"]
-        
-        fig = go.Figure(data=[go.Pie(
-            labels=error_counts["error_type"],
-            values=error_counts["count"],
-            hole=0.4,
-            marker=dict(colors=["#f85149", "#d29922", "#58a6ff"])
-        )])
-        fig.update_layout(
-            template="plotly_dark",
-            height=280,
-            margin=dict(l=20, r=20, t=20, b=20),
-            showlegend=True,
-            legend=dict(orientation="h", yanchor="bottom", y=-0.2),
-        )
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        if st.session_state.incident_mode:
-            # Show simulated error breakdown
-            st.markdown(f"""
-            <div class="metric-card" style="border-color: var(--accent-red);">
-                <div style="color: var(--accent-red); font-weight: 600;">⚠️ Incident Mode Active</div>
-                <div style="color: var(--text-secondary); margin-top: 0.5rem;">
-                    Simulated errors: timeout (15), validation (7), auth (4)
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
-        else:
-            st.info("No error breakdown available (no failed requests)")
-
-st.divider()
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# PANEL 4: COST OVER TIME
-# ═══════════════════════════════════════════════════════════════════════════════
-
-st.markdown("""
-<div class="panel-header">
-    <span>💰</span> 4. Cost Over Time
-    <span style="margin-left: auto; font-size: 0.8rem; color: var(--text-secondary);">
-        Rolling cost analysis with SLO budget
-    </span>
-</div>
-""", unsafe_allow_html=True)
-
-cost_col1, cost_col2 = st.columns([1, 2])
-
-with cost_col1:
-    total_cost = response_df["cost_usd"].sum() if "cost_usd" in response_df else 0
-    avg_cost_per_req = total_cost / len(response_df) if len(response_df) > 0 else 0
-    budget_used_pct = (total_cost / SLO["daily_cost_usd"] * 100) if SLO["daily_cost_usd"] > 0 else 0
-    
-    cost_status, _, is_breach = get_slo_status(total_cost, SLO["daily_cost_usd"], True)
-    
-    st.markdown(f"""
-    <div class="metric-card" style="{'border-color: var(--accent-yellow);' if budget_used_pct > 80 else ''}">
-        <div style="color: var(--accent-yellow); font-weight: 600;">Total Cost</div>
-        <div style="font-size: 2rem; font-weight: 700;">${total_cost:.4f}</div>
-        <div style="color: {('var(--accent-yellow)' if is_breach else 'var(--accent-green)')}; font-size: 0.85rem; margin-top: 0.25rem;">
-            {cost_status} • Budget: ${SLO["daily_cost_usd"]:.2f}
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    # Budget progress bar
-    progress_color = "#f85149" if budget_used_pct > 100 else "#d29922" if budget_used_pct > 80 else "#3fb950"
-    st.markdown(f"""
-    <div class="metric-card">
-        <div style="color: var(--text-secondary); font-size: 0.85rem; margin-bottom: 0.5rem;">Budget Used</div>
-        <div style="background: var(--bg-secondary); border-radius: 4px; height: 8px; overflow: hidden;">
-            <div style="width: {min(budget_used_pct, 100):.1f}%; background: {progress_color}; height: 100%;"></div>
-        </div>
-        <div style="color: var(--text-secondary); font-size: 0.8rem; margin-top: 0.25rem; text-align: right;">
-            {budget_used_pct:.1f}%
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    st.markdown(f"""
-    <div class="metric-card">
-        <div style="color: var(--text-secondary); font-weight: 600;">Avg per Request</div>
-        <div style="font-size: 1.3rem; font-weight: 700;">${avg_cost_per_req:.4f}</div>
-    </div>
-    """, unsafe_allow_html=True)
-
-with cost_col2:
-    if not response_df.empty and "cost_usd" in response_df.columns and "ts" in response_df.columns:
-        # Cost over time area chart
-        cost_ts = response_df.set_index("ts")
-        cost_by_time = cost_ts["cost_usd"].resample("1min").sum().cumsum().reset_index()
-        cost_by_time.columns = ["time", "cumulative_cost"]
-        
+        by_min = received.set_index("ts").resample("1min").size().reset_index(name="requests")
         fig = go.Figure()
-        fig.add_trace(go.Scatter(
-            x=cost_by_time["time"], y=cost_by_time["cumulative_cost"],
-            fill="tozeroy", name="Cumulative Cost",
-            line=dict(color="#d29922"), fillcolor="rgba(210, 153, 34, 0.3)"
-        ))
-        
-        # Add SLO threshold
-        fig.add_hline(
-            y=SLO["daily_cost_usd"],
-            line_dash="dash",
-            line_color="#f85149",
-            annotation_text=f"Budget: ${SLO['daily_cost_usd']}"
-        )
-        
-        fig.update_layout(
-            template="plotly_dark",
-            height=280,
-            margin=dict(l=20, r=20, t=20, b=20),
-            yaxis_title="Cumulative Cost (USD)",
-            hovermode="x unified"
-        )
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("No cost data available")
+        fig.add_trace(go.Bar(x=by_min["ts"], y=by_min["requests"], name="Requests",
+                             marker_color=C_BLUE, opacity=0.75))
+        mark_incidents(fig, windows)
+        st.plotly_chart(style_figure(fig, ytitle="req / phút"), width="stretch")
 
-st.divider()
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# PANEL 5: TOKEN TOTALS
-# ═══════════════════════════════════════════════════════════════════════════════
+def panel_errors(container, data: dict, windows: list[dict]) -> None:
+    with container:
+        error_rate = data["error_rate_pct"]
+        target = SLO.get("error_rate_pct", 2)
+        breach = error_rate > target
+        panel_header("errors", "Error rate and breakdown",
+                     verdict_html(not breach, "Trong ngưỡng", "Vượt SLO"))
 
-st.markdown("""
-<div class="panel-header">
-    <span>🔤</span> 5. Token Usage
-    <span style="margin-left: auto; font-size: 0.8rem; color: var(--text-secondary);">
-        Input and output token breakdown
-    </span>
-</div>
-""", unsafe_allow_html=True)
+        cols = st.columns(3)
+        cols[0].metric("Error rate", f"{error_rate:.2f} %", f"SLO ≤ {target}%")
+        cols[1].metric("Failed", f"{data['count_failed']:,}")
+        cols[2].metric("Received", f"{data['count_received']:,}")
 
-token_col1, token_col2 = st.columns([1, 2])
+        failed = data["failed"]
+        if failed.empty:
+            st.success(f"0 request lỗi trong cửa sổ — error_rate_pct = {error_rate:.2f}%.")
+            st.caption("Công thức: `count(request_failed) / count(request_received) * 100`")
+            return
 
-with token_col1:
-    tokens_in = response_df["tokens_in"].sum() if "tokens_in" in response_df else 0
-    tokens_out = response_df["tokens_out"].sum() if "tokens_out" in response_df else 0
-    total_tokens = tokens_in + tokens_out
-    in_out_ratio = tokens_out / tokens_in if tokens_in > 0 else 0
-    
-    st.markdown(f"""
-    <div class="metric-card">
-        <div style="color: var(--accent-blue); font-weight: 600;">Tokens In</div>
-        <div style="font-size: 1.5rem; font-weight: 700;">{tokens_in:,}</div>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    st.markdown(f"""
-    <div class="metric-card">
-        <div style="color: var(--accent-purple); font-weight: 600;">Tokens Out</div>
-        <div style="font-size: 1.5rem; font-weight: 700;">{tokens_out:,}</div>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    st.markdown(f"""
-    <div class="metric-card">
-        <div style="color: var(--accent-green); font-weight: 600;">Total</div>
-        <div style="font-size: 1.5rem; font-weight: 700;">{total_tokens:,}</div>
-        <div style="color: var(--text-secondary); font-size: 0.85rem; margin-top: 0.25rem;">
-            In/Out ratio: {in_out_ratio:.2f}
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-with token_col2:
-    if not response_df.empty and "tokens_in" in response_df.columns and "tokens_out" in response_df.columns:
-        if "ts" in response_df.columns:
-            # Multi-line token chart
-            token_ts = response_df.set_index("ts")
-            token_by_time = token_ts[["tokens_in", "tokens_out"]].resample("1min").sum().reset_index()
-            
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(
-                x=token_by_time["ts"], y=token_by_time["tokens_in"],
-                name="Tokens In", line=dict(color="#58a6ff"), stackgroup="one", fillcolor="rgba(88, 166, 255, 0.3)"
-            ))
-            fig.add_trace(go.Scatter(
-                x=token_by_time["ts"], y=token_by_time["tokens_out"],
-                name="Tokens Out", line=dict(color="#a371f7"), stackgroup="one", fillcolor="rgba(163, 113, 247, 0.3)"
-            ))
-            
-            fig.update_layout(
-                template="plotly_dark",
-                height=280,
-                margin=dict(l=20, r=20, t=20, b=20),
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-                hovermode="x unified",
-                yaxis_title="Tokens / min"
+        if "error_type" in failed.columns:
+            breakdown = failed["error_type"].value_counts()
+            fig = go.Figure(
+                go.Bar(x=breakdown.values, y=breakdown.index, orientation="h",
+                       marker_color=C_RED)
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(style_figure(fig, height=220, ytitle=""), width="stretch")
         else:
-            # Bar chart fallback
-            fig = go.Figure(data=[
-                go.Bar(name="Tokens In", x=["Total"], y=[tokens_in], marker_color="#58a6ff"),
-                go.Bar(name="Tokens Out", x=["Total"], y=[tokens_out], marker_color="#a371f7")
-            ])
-            fig.update_layout(template="plotly_dark", height=280, barmode="stack")
-            st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("No token data available")
+            st.caption("Log lỗi chưa có trường `error_type` để breakdown.")
 
-st.divider()
+
+def panel_cost(container, data: dict, windows: list[dict]) -> None:
+    with container:
+        total = data["total_cost_usd"]
+        budget = SLO.get("daily_cost_usd", 2.5)
+        breach = total > budget
+        panel_header("cost", "Cost over time",
+                     verdict_html(not breach, "Trong budget", "Vượt budget"))
+
+        cols = st.columns(3)
+        cols[0].metric("Tổng cost", f"${total:.4f}", f"Budget ${budget:.2f}")
+        cols[1].metric("Cost / request", f"${data['avg_cost_usd']:.5f}")
+        cols[2].metric("Budget đã dùng", f"{(total / budget * 100) if budget else 0:.1f} %")
+
+        responses = data["responses"]
+        if responses.empty or "ts" not in responses.columns or "cost_usd" not in responses.columns:
+            st.caption("Chưa có `cost_usd` để vẽ cost.")
+            return
+
+        by_min = responses.set_index("ts")["cost_usd"].astype(float).resample("1min").sum()
+        frame = by_min.cumsum().reset_index(name="cumulative")
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=frame["ts"], y=frame["cumulative"], name="Cost tích luỹ",
+                                 fill="tozeroy", line=dict(color=C_YELLOW, width=2),
+                                 fillcolor="rgba(255,201,92,.22)"))
+        threshold_line(fig, budget, f"Budget ${budget}")
+        mark_incidents(fig, windows)
+        st.plotly_chart(style_figure(fig, ytitle="USD"), width="stretch")
+
+
+def panel_tokens(container, data: dict, windows: list[dict]) -> None:
+    with container:
+        tokens_in, tokens_out = data["tokens_in"], data["tokens_out"]
+        panel_header("tokens", "Input and output tokens")
+
+        cols = st.columns(3)
+        cols[0].metric("Tokens in", f"{tokens_in:,}")
+        cols[1].metric("Tokens out", f"{tokens_out:,}")
+        cols[2].metric("Tỉ lệ out/in", f"{(tokens_out / tokens_in) if tokens_in else 0:.2f}")
+
+        responses = data["responses"]
+        if responses.empty or "ts" not in responses.columns or "tokens_in" not in responses.columns:
+            st.caption("Chưa có dữ liệu token.")
+            return
+
+        by_min = (
+            responses.set_index("ts")[["tokens_in", "tokens_out"]]
+            .astype(float).resample("1min").sum().reset_index()
+        )
+        fig = go.Figure()
+        fig.add_trace(go.Bar(x=by_min["ts"], y=by_min["tokens_in"], name="Tokens in",
+                             marker_color=C_BLUE))
+        fig.add_trace(go.Bar(x=by_min["ts"], y=by_min["tokens_out"], name="Tokens out",
+                             marker_color=C_VIOLET))
+        fig.update_layout(barmode="stack")
+        mark_incidents(fig, windows)
+        st.plotly_chart(style_figure(fig, ytitle="tokens / phút"), width="stretch")
+
+
+def panel_quality(container, data: dict, windows: list[dict]) -> None:
+    with container:
+        quality = data["quality_avg"]
+        target = SLO.get("quality_score_avg", 0.75)
+        breach = quality < target
+        panel_header("quality", "Quality proxy",
+                     verdict_html(not breach, "Đạt guardrail", "Dưới guardrail"))
+
+        cols = st.columns(3)
+        cols[0].metric("Mean quality", f"{quality:.3f}", f"SLO ≥ {target}")
+        cols[1].metric("Min", f"{data['quality_min']:.3f}")
+        cols[2].metric("Số response", f"{data['count_responses']:,}")
+
+        responses = data["responses"]
+        if responses.empty or "ts" not in responses.columns or "quality_score" not in responses.columns:
+            st.caption("Chưa có `quality_score` để vẽ.")
+            return
+
+        by_min = (
+            responses.set_index("ts")["quality_score"].astype(float)
+            .resample("1min").mean().dropna().reset_index()
+        )
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=by_min["ts"], y=by_min["quality_score"], name="Quality",
+                                 mode="lines+markers", line=dict(color=C_GREEN, width=2),
+                                 fill="tozeroy", fillcolor="rgba(86,223,155,.18)"))
+        threshold_line(fig, target, f"SLO ≥ {target}", color=C_GREEN)
+        mark_incidents(fig, windows)
+        fig.update_yaxes(range=[0, 1.05])
+        st.plotly_chart(style_figure(fig, ytitle="score 0–1"), width="stretch")
+
+
+def render_six_panels(data: dict, windows: list[dict]) -> None:
+    """6 panel đúng thứ tự contract: latency · traffic · errors · cost · tokens · quality."""
+    row1 = st.columns(2)
+    panel_latency(row1[0].container(border=True), data, windows)
+    panel_traffic(row1[1].container(border=True), data, windows)
+
+    row2 = st.columns(2)
+    panel_errors(row2[0].container(border=True), data, windows)
+    panel_cost(row2[1].container(border=True), data, windows)
+
+    row3 = st.columns(2)
+    panel_tokens(row3[0].container(border=True), data, windows)
+    panel_quality(row3[1].container(border=True), data, windows)
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# PANEL 6: QUALITY SCORE
+# 01 — API HOẠT ĐỘNG
 # ═══════════════════════════════════════════════════════════════════════════════
 
-st.markdown("""
-<div class="panel-header">
-    <span>⭐</span> 6. Quality Score
-    <span style="margin-left: auto; font-size: 0.8rem; color: var(--text-secondary);">
-        Mean quality proxy (0-1 scale)
-    </span>
-</div>
-""", unsafe_allow_html=True)
 
-quality_col1, quality_col2 = st.columns([1, 2])
+def check_health(base_url: str) -> tuple[bool, dict | str]:
+    try:
+        import httpx
 
-with quality_col1:
-    quality_mean = response_df["quality_score"].mean() if "quality_score" in response_df else 0
-    quality_median = response_df["quality_score"].median() if "quality_score" in response_df else 0
-    quality_min = response_df["quality_score"].min() if "quality_score" in response_df else 0
-    quality_max = response_df["quality_score"].max() if "quality_score" in response_df else 0
-    
-    quality_status, css_class, is_breach = get_slo_status(quality_mean, SLO["quality_score_avg"], False)
-    
-    st.markdown(f"""
-    <div class="metric-card" style="{'border-color: var(--accent-yellow);' if is_breach else ''}">
-        <div style="color: var(--accent-yellow); font-weight: 600;">Mean Quality</div>
-        <div style="font-size: 2rem; font-weight: 700; color: {'var(--accent-yellow)' if is_breach else 'var(--text-primary)'};">
-            {quality_mean:.3f}
-        </div>
-        <div style="color: {('var(--accent-yellow)' if is_breach else 'var(--accent-green)')}; font-size: 0.85rem; margin-top: 0.25rem;">
-            {quality_status} • SLO: {SLO["quality_score_avg"]:.2f}
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    st.markdown(f"""
-    <div class="metric-card">
-        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem;">
-            <div>
-                <div style="color: var(--text-secondary); font-size: 0.75rem;">Median</div>
-                <div style="font-weight: 600;">{quality_median:.3f}</div>
-            </div>
-            <div>
-                <div style="color: var(--text-secondary); font-size: 0.75rem;">Min</div>
-                <div style="font-weight: 600;">{quality_min:.3f}</div>
-            </div>
-            <div>
-                <div style="color: var(--text-secondary); font-size: 0.75rem;">Max</div>
-                <div style="font-weight: 600;">{quality_max:.3f}</div>
-            </div>
-            <div>
-                <div style="color: var(--text-secondary); font-size: 0.75rem;">Count</div>
-                <div style="font-weight: 600;">{len(response_df)}</div>
-            </div>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
+        response = httpx.get(f"{base_url}/health", timeout=2.0)
+        return response.status_code == 200, response.json()
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
 
-with quality_col2:
-    if not response_df.empty and "quality_score" in response_df.columns:
-        if "ts" in response_df.columns:
-            # Quality over time with threshold
-            quality_ts = response_df.set_index("ts")
-            quality_by_time = quality_ts["quality_score"].resample("1min").mean().reset_index()
-            
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(
-                x=quality_by_time["ts"], y=quality_by_time["quality_score"],
-                name="Quality", line=dict(color="#d29922", width=2), fill="tozeroy", fillcolor="rgba(210, 153, 34, 0.2)"
-            ))
-            
-            # SLO threshold line
-            fig.add_hline(
-                y=SLO["quality_score_avg"],
-                line_dash="dash",
-                line_color="#3fb950",
-                annotation_text=f"SLO: {SLO['quality_score_avg']}"
-            )
-            
-            fig.update_layout(
-                template="plotly_dark",
-                height=280,
-                margin=dict(l=20, r=20, t=20, b=20),
-                yaxis=dict(range=[0, 1.05]),
-                hovermode="x unified"
-            )
-            st.plotly_chart(fig, use_container_width=True)
+
+def view_api() -> None:
+    st.markdown("## 01 · API hoạt động")
+    st.markdown(
+        "<div class='lede'>Show <code>/health</code> → gửi một request <code>/chat</code> → "
+        "response phải có correlation ID, latency, token, cost và quality.</div>",
+        unsafe_allow_html=True,
+    )
+
+    left, right = st.columns([1, 2])
+
+    with left.container(border=True):
+        st.markdown("#### `GET /health`")
+        base_url = st.text_input("Base URL", value="http://127.0.0.1:8000", label_visibility="collapsed")
+        if st.button("Gọi /health", width="stretch"):
+            st.session_state["health"] = check_health(base_url)
+        ok, payload = st.session_state.get("health", (None, None))
+        if ok is None:
+            st.caption("Bấm nút để kiểm tra service đang chạy.")
+        elif ok:
+            st.success("Service UP")
+            st.json(payload)
         else:
-            # Distribution histogram
-            fig = px.histogram(
-                response_df, x="quality_score", nbins=20,
-                title="Quality Score Distribution",
-                color_discrete_sequence=["#d29922"]
-            )
-            fig.add_vline(x=SLO["quality_score_avg"], line_dash="dash", line_color="#3fb950")
-            fig.update_layout(template="plotly_dark", height=280)
-            st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("No quality score data available")
+            st.error("Không gọi được /health — API chưa chạy?")
+            st.code(str(payload))
+            st.caption("Khởi động: `uvicorn app.main:app --reload`")
 
-st.divider()
+    with right.container(border=True):
+        st.markdown("#### Request gần nhất trong log")
+        responses = metrics["responses"]
+        if responses.empty:
+            st.info("Chưa có `response_sent` trong cửa sổ đang chọn.")
+        else:
+            latest = responses.sort_values("ts").iloc[-1]
+            st.markdown(
+                f"Correlation ID: **`{latest.get('correlation_id', '—')}`** · "
+                f"feature `{latest.get('feature', '—')}` · model `{latest.get('model', '—')}`"
+            )
+            cols = st.columns(4)
+            cols[0].metric("Latency", f"{float(latest.get('latency_ms', 0)):.0f} ms")
+            cols[1].metric("Tokens in/out",
+                           f"{int(latest.get('tokens_in', 0))}/{int(latest.get('tokens_out', 0))}")
+            cols[2].metric("Cost", f"${float(latest.get('cost_usd', 0)):.5f}")
+            cols[3].metric("Quality", f"{float(latest.get('quality_score', 0)):.2f}")
+            st.caption(
+                "Bốn chỉ số này chính là nguồn của panel latency · token · cost · quality."
+            )
+
+    with st.container(border=True):
+        st.markdown("#### Trạng thái incident (từ log điều khiển)")
+        active = {w["name"] for w in windows_all if not w["closed"]}
+        cols = st.columns(3)
+        for i, name in enumerate(["rag_slow", "tool_fail", "cost_spike"]):
+            is_on = name in active
+            cols[i].markdown(
+                f"<div class='step'><small>scenario</small>"
+                f"<div class='title'><code>{name}</code></div>"
+                f"<div class='body' style='color:{C_RED if is_on else C_GREEN};font-weight:800;'>"
+                f"{'ĐANG BẬT' if is_on else 'tắt'}</div></div>",
+                unsafe_allow_html=True,
+            )
+        st.caption(
+            "Bật/tắt bằng `python scripts/inject_incident.py --scenario rag_slow` "
+            "(thêm `--disable` để tắt)."
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 02 — LOGGING & BẢO MẬT
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def view_logging() -> None:
+    st.markdown("## 02 · Logging & bảo mật")
+    st.markdown(
+        "<div class='lede'>Log JSON có cấu trúc → các event cùng một correlation ID → "
+        "email, số điện thoại và thẻ đã bị redact.</div>",
+        unsafe_allow_html=True,
+    )
+
+    ids_in_window = unique_correlation_ids(df_window)
+
+    with st.container(border=True):
+        st.markdown("#### Correlation ID xuyên suốt một request")
+        if not ids_in_window:
+            st.info("Không có correlation ID trong cửa sổ đang chọn.")
+        else:
+            selected = st.selectbox(
+                "Chọn correlation ID để xem toàn bộ event của request đó",
+                ids_in_window,
+                index=len(ids_in_window) - 1,
+                key="corr_pick",
+            )
+            related = df_window[df_window["correlation_id"] == selected].sort_values("ts")
+            st.caption(
+                f"**{len(related)} event** dùng chung `{selected}` — "
+                f"{' → '.join(related['event'].tolist())}"
+            )
+            for _, row in related.iterrows():
+                record = {k: v for k, v in row.to_dict().items() if pd.notna(v)}
+                if isinstance(record.get("ts"), pd.Timestamp):
+                    record["ts"] = record["ts"].isoformat()
+                st.code(json.dumps(record, ensure_ascii=False, indent=2), language="json")
+
+    scan_left, scan_right = st.columns(2)
+
+    with scan_left.container(border=True):
+        st.markdown("#### Quét PII bằng detector của grader")
+        detectors = load_pii_detectors()
+        haystack = "\n".join(raw_lines)
+        leaks = {name: len(pattern.findall(haystack)) for name, pattern in detectors.items()}
+        total_leaks = sum(leaks.values())
+
+        if total_leaks == 0:
+            st.markdown(
+                f"<div class='big' style='color:{C_GREEN};font-size:30px;font-weight:900;'>"
+                f"0 PII leak</div>",
+                unsafe_allow_html=True,
+            )
+            st.caption(
+                f"Quét {len(raw_lines)} dòng log bằng {len(detectors)} detector "
+                f"({', '.join(detectors)}) — không còn dữ liệu thô."
+            )
+        else:
+            st.error(f"Phát hiện {total_leaks} PII leak")
+            st.json(leaks)
+
+    with scan_right.container(border=True):
+        st.markdown("#### Bằng chứng đã redact")
+        redactions = re.findall(r"\[REDACTED_([A-Z_]+)\]", haystack)
+        if not redactions:
+            st.info("Chưa có log nào chứa PII để redact — thử gửi query có email/SĐT/thẻ.")
+        else:
+            counts = pd.Series(redactions).value_counts()
+            st.dataframe(
+                counts.rename_axis("Loại PII").reset_index(name="Số lần redact"),
+                width="stretch", hide_index=True,
+            )
+            samples = [line for line in raw_lines if "[REDACTED_" in line][:3]
+            st.caption("Ví dụ payload đã che:")
+            for line in samples:
+                record = json.loads(line)
+                preview = (record.get("payload") or {}).get("message_preview") or json.dumps(
+                    record.get("payload"), ensure_ascii=False
+                )
+                st.code(f"{record.get('correlation_id', '—')}  →  {preview}", language="text")
+
+    with st.container(border=True):
+        st.markdown("#### Chất lượng schema log")
+        cols = st.columns(4)
+        cols[0].metric("Bản ghi hợp lệ", f"{len(raw_lines):,}")
+        cols[1].metric("Dòng hỏng", f"{malformed_lines:,}")
+        cols[2].metric("Correlation ID duy nhất", f"{len(trace_ids_all):,}")
+        enrich_fields = ["user_id_hash", "session_id", "feature", "model"]
+        api_rows = df_all[df_all.get("service") == "api"] if "service" in df_all.columns else pd.DataFrame()
+        missing = 0
+        if not api_rows.empty:
+            missing = int(sum(1 for _, r in api_rows.iterrows() if any(pd.isna(r.get(f)) for f in enrich_fields)))
+        cols[3].metric("API log thiếu enrichment", f"{missing:,}")
+        st.caption(
+            "Enrichment bắt buộc: `user_id_hash`, `session_id`, `feature`, `model` — "
+            "đây là phần validate_logs.py chấm 20 điểm."
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 03 — DASHBOARD (6 panel + baseline + SLO)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def view_dashboard() -> None:
+    st.markdown("## 03 · Dashboard")
+    st.markdown(
+        "<div class='lede'>Đủ 6 nhóm chỉ số → nêu số liệu baseline → nêu SLO/threshold "
+        "và cách nhận biết bất thường.</div>",
+        unsafe_allow_html=True,
+    )
+
+    baseline_df, incident_df = split_by_incident(df_all, windows_all)
+    baseline = compute_metrics(baseline_df)
+
+    with st.container(border=True):
+        st.markdown("#### Baseline vs cửa sổ đang xem")
+        st.caption(
+            "Baseline = toàn bộ dữ liệu **ngoài** mọi cửa sổ incident. Đây là số liệu để "
+            "so sánh khi có bất thường."
+        )
+        rows = [
+            ("Latency P95 (ms)", baseline["latency_p95"], metrics["latency_p95"],
+             SLO.get("latency_p95_ms", 3000), "lte"),
+            ("Error rate (%)", baseline["error_rate_pct"], metrics["error_rate_pct"],
+             SLO.get("error_rate_pct", 2), "lte"),
+            ("Cost (USD)", baseline["total_cost_usd"], metrics["total_cost_usd"],
+             SLO.get("daily_cost_usd", 2.5), "lte"),
+            ("Quality (avg)", baseline["quality_avg"], metrics["quality_avg"],
+             SLO.get("quality_score_avg", 0.75), "gte"),
+        ]
+        table = []
+        for label, base_value, current, target, operator in rows:
+            healthy = current <= target if operator == "lte" else current >= target
+            table.append(
+                {
+                    "Chỉ số": label,
+                    "Baseline": f"{base_value:,.4f}".rstrip("0").rstrip(".") if base_value else "0",
+                    "Hiện tại": f"{current:,.4f}".rstrip("0").rstrip(".") if current else "0",
+                    "SLO": f"{'≤' if operator == 'lte' else '≥'} {target}",
+                    "Trạng thái": "✅ OK" if healthy else "🚨 BREACH",
+                }
+            )
+        st.dataframe(pd.DataFrame(table), width="stretch", hide_index=True)
+
+    st.markdown("#### 6 panel theo `config/dashboard.yaml`")
+    render_six_panels(metrics, windows_view)
+
+    with st.container(border=True):
+        st.markdown("#### Cách nhận biết bất thường")
+        for alert in ALERTS:
+            st.markdown(
+                f"- **`{alert['name']}`** ({alert['severity']}) — {alert['summary']}  \n"
+                f"  điều kiện `{alert['condition']}` · owner `{alert['owner']}` · runbook `{alert['runbook']}`"
+            )
+        if not ALERTS:
+            st.caption("Chưa đọc được `config/alert_rules.yaml`.")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 04 — LANGFUSE & PROMPT VERSIONING
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def view_langfuse() -> None:
+    st.markdown("## 04 · Langfuse — tracing & prompt versioning")
+    st.markdown(
+        "<div class='lede'>Tối thiểu 10 traces → mở một trace để drill-down → "
+        "prompt v1/v2 kèm bằng chứng đổi label hoặc rollback.</div>",
+        unsafe_allow_html=True,
+    )
+
+    host = os.getenv("LANGFUSE_HOST", "https://cloud.langfuse.com")
+
+    top = st.columns(3)
+    top[0].metric("Traces (correlation ID)", f"{len(trace_ids_all)}",
+                  f"yêu cầu ≥ {PASS_TRACE_COUNT}")
+    top[1].metric("Prompt name", os.getenv("LANGFUSE_PROMPT_NAME", "day13-chat"))
+    top[2].metric("Prompt label đang chạy", os.getenv("LANGFUSE_PROMPT_LABEL", "production"))
+    st.caption(
+        f"Mỗi correlation ID tương ứng một trace `chat-agent` trong Langfuse. "
+        f"Mở drill-down tại {host} → Traces, lọc theo session hoặc user hash."
+    )
+
+    with st.container(border=True):
+        st.markdown("#### Danh sách trace để chọn drill-down")
+        responses = event_subset(df_window, "response_sent")
+        if responses.empty:
+            st.info("Chưa có trace nào trong cửa sổ đang chọn.")
+            return
+
+        columns = [c for c in
+                   ["ts", "correlation_id", "feature", "model", "session_id", "user_id_hash",
+                    "latency_ms", "tokens_in", "tokens_out", "cost_usd", "quality_score"]
+                   if c in responses.columns]
+        table = responses[columns].sort_values("ts", ascending=False).copy()
+        if "ts" in table.columns:
+            table["ts"] = table["ts"].dt.strftime("%H:%M:%S")
+        st.dataframe(table, width="stretch", hide_index=True, height=280)
+
+    with st.container(border=True):
+        st.markdown("#### Drill-down một trace")
+        ids = unique_correlation_ids(df_window)
+        if not ids:
+            st.info("Không có correlation ID để drill-down.")
+            return
+        picked = st.selectbox("Correlation ID", ids, index=len(ids) - 1, key="lf_pick")
+        related = df_window[df_window["correlation_id"] == picked].sort_values("ts")
+
+        spans = []
+        for _, row in related.iterrows():
+            spans.append(
+                {
+                    "Thời điểm": row["ts"].strftime("%H:%M:%S.%f")[:-3] if pd.notna(row.get("ts")) else "—",
+                    "Event": row.get("event", "—"),
+                    "Latency (ms)": row.get("latency_ms", "—"),
+                    "Cost (USD)": row.get("cost_usd", "—"),
+                    "Quality": row.get("quality_score", "—"),
+                }
+            )
+        st.dataframe(pd.DataFrame(spans), width="stretch", hide_index=True)
+        st.caption(
+            "Trong Langfuse, trace này có cấu trúc `chat-agent` (agent) → `rag-retriever` "
+            "(retriever) → `llm-generation` (generation); metadata mang `prompt_name`, "
+            "`prompt_version`, `prompt_label`, `prompt_source`."
+        )
+
+    with st.container(border=True):
+        st.markdown("#### Prompt versioning")
+        st.markdown(
+            "- Prompt `day13-chat` được lấy qua Langfuse Prompt Management "
+            "(`app/prompt_management.py::resolve_prompt`), có fallback local khi Langfuse lỗi.\n"
+            "- Label đang áp dụng đọc từ biến môi trường `LANGFUSE_PROMPT_LABEL`; đổi label "
+            "hoặc rollback chỉ cần trỏ label `production` sang version khác — không phải deploy lại.\n"
+            "- Mỗi trace ghi kèm `prompt_version` và `prompt_label`, nên so sánh v1 vs v2 là so "
+            "hai tập trace cùng metadata."
+        )
+        st.caption("Chi tiết quy trình: `docs/PROMPT_VERSIONING.md`")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 05 — DEMO MỘT INCIDENT (Metric → Trace → Log → Root cause → Fix → Prevention)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def view_incident() -> None:
+    st.markdown("## 05 · Demo một incident")
+    st.markdown(
+        "<div class='lede'>Metric bất thường → Trace liên quan → Log chứng minh → "
+        "Root cause → Cách xử lý → Cách phòng ngừa.</div>",
+        unsafe_allow_html=True,
+    )
+
+    if not windows_all:
+        st.info(
+            "Chưa phát hiện incident nào trong log. Tạo một incident để demo:\n\n"
+            "```\npython scripts/inject_incident.py --scenario rag_slow\n"
+            "python scripts/load_test.py --concurrency 5\n"
+            "python scripts/inject_incident.py --scenario rag_slow --disable\n```"
+        )
+        return
+
+    labels = {
+        f"{i + 1}. {w['name']} — {w['start'].strftime('%H:%M:%S')} → "
+        f"{w['end'].strftime('%H:%M:%S')}{'' if w['closed'] else ' (đang bật)'}": w
+        for i, w in enumerate(windows_all)
+    }
+    picked_label = st.selectbox("Chọn cửa sổ incident", list(labels), index=len(labels) - 1)
+    window = labels[picked_label]
+    scenario = window["name"]
+    kb = INCIDENT_KB.get(scenario, {})
+
+    baseline_df, _ = split_by_incident(df_all, windows_all)
+    inside_df = df_all[(df_all["ts"] >= window["start"]) & (df_all["ts"] <= window["end"])]
+    baseline = compute_metrics(baseline_df)
+    during = compute_metrics(inside_df)
+
+    # ─── Bước 1: Metric bất thường ────────────────────────────────────────────
+    with st.container(border=True):
+        st.markdown("#### Bước 1 — Metric bất thường")
+        cols = st.columns(4)
+        cols[0].metric("P95 latency", f"{during['latency_p95']:.0f} ms",
+                       f"{during['latency_p95'] - baseline['latency_p95']:+.0f} ms so baseline",
+                       delta_color="inverse")
+        cols[1].metric("Error rate", f"{during['error_rate_pct']:.2f} %",
+                       f"{during['error_rate_pct'] - baseline['error_rate_pct']:+.2f} pp",
+                       delta_color="inverse")
+        cols[2].metric("Cost / request", f"${during['avg_cost_usd']:.5f}",
+                       f"{during['avg_cost_usd'] - baseline['avg_cost_usd']:+.5f}",
+                       delta_color="inverse")
+        cols[3].metric("Tokens out", f"{during['tokens_out']:,}")
+        st.caption(f"Dấu hiệu đặc trưng của `{scenario}`: {kb.get('signal', '—')}")
+
+        responses_all = event_subset(df_all, "response_sent")
+        if not responses_all.empty and "ts" in responses_all.columns:
+            series = responses_all.set_index("ts")["latency_ms"].astype(float)
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=series.index, y=series.values, name="latency mỗi request",
+                                     mode="lines+markers", line=dict(color=C_BLUE, width=1.6)))
+            threshold_line(fig, SLO.get("latency_p95_ms", 3000),
+                           f"SLO P95 ≤ {SLO.get('latency_p95_ms', 3000):.0f}ms")
+            mark_incidents(fig, windows_all)
+            st.plotly_chart(style_figure(fig, height=260, ytitle="ms"), width="stretch")
+
+    # ─── Bước 2 & 3: Trace và Log ─────────────────────────────────────────────
+    trace_col, log_col = st.columns(2)
+
+    slow_requests = event_subset(inside_df, "response_sent")
+    if not slow_requests.empty and "latency_ms" in slow_requests.columns:
+        slow_requests = slow_requests.sort_values("latency_ms", ascending=False)
+
+    with trace_col.container(border=True):
+        st.markdown("#### Bước 2 — Trace liên quan")
+        if slow_requests.empty:
+            st.caption("Không có response nào trong cửa sổ incident.")
+            picked_trace = None
+        else:
+            columns = [c for c in ["correlation_id", "latency_ms", "feature", "cost_usd"]
+                       if c in slow_requests.columns]
+            st.dataframe(slow_requests[columns].head(5), width="stretch", hide_index=True)
+            picked_trace = slow_requests.iloc[0].get("correlation_id")
+            st.caption(f"Trace chậm nhất: **`{picked_trace}`** — mở trace này trong Langfuse để xem span nào ăn thời gian.")
+
+    with log_col.container(border=True):
+        st.markdown("#### Bước 3 — Log chứng minh")
+        control = inside_df[inside_df["event"].isin(["incident_enabled", "incident_disabled"])]
+        if not control.empty:
+            row = control.iloc[0].to_dict()
+            if isinstance(row.get("ts"), pd.Timestamp):
+                row["ts"] = row["ts"].isoformat()
+            st.code(json.dumps({k: v for k, v in row.items() if pd.notna(v)},
+                               ensure_ascii=False, indent=2), language="json")
+        if slow_requests is not None and not slow_requests.empty:
+            row = slow_requests.iloc[0].to_dict()
+            if isinstance(row.get("ts"), pd.Timestamp):
+                row["ts"] = row["ts"].isoformat()
+            st.code(json.dumps({k: v for k, v in row.items() if pd.notna(v)},
+                               ensure_ascii=False, indent=2), language="json")
+            st.caption("Cùng `correlation_id` với trace ở bước 2 — metric, trace và log khớp nhau.")
+
+    # ─── Bước 4, 5, 6 ─────────────────────────────────────────────────────────
+    steps = st.columns(3)
+    with steps[0]:
+        st.markdown(step_card("4", "Root cause", kb.get("root_cause", "—")), unsafe_allow_html=True)
+    with steps[1]:
+        fixes = "".join(f"• {item}<br>" for item in kb.get("fix", []))
+        st.markdown(step_card("5", "Cách xử lý", fixes or "—"), unsafe_allow_html=True)
+    with steps[2]:
+        prevents = "".join(f"• {item}<br>" for item in kb.get("prevent", []))
+        st.markdown(step_card("6", "Cách phòng ngừa", prevents or "—"), unsafe_allow_html=True)
+
+    st.caption(
+        f"Panel bị ảnh hưởng rõ nhất: **{kb.get('panel', '—')}** — đây cũng là panel nên mở "
+        "đầu tiên khi alert bắn."
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 06 — KẾT QUẢ KIỂM TRA
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def view_validation() -> None:
+    st.markdown("## 06 · Kết quả kiểm tra")
+    st.markdown(
+        "<div class='lede'>Tests quan trọng pass → <code>validate_logs.py</code> ≥ 80/100 → "
+        "<code>validate_dashboard.py</code> báo 6/6 panel.</div>",
+        unsafe_allow_html=True,
+    )
+
+    render_gate()
+    st.divider()
+
+    with st.container(border=True):
+        st.markdown(f"#### `python scripts/validate_logs.py` — yêu cầu ≥ {PASS_LOG_SCORE}/100")
+        st.code(log_out.strip() or "(không có output)", language="text")
+
+    with st.container(border=True):
+        st.markdown("#### `python scripts/validate_dashboard.py` — yêu cầu 6/6 panel")
+        st.code(dash_out.strip() or "(không có output)", language="text")
+
+    with st.container(border=True):
+        st.markdown("#### `python scripts/validate_alerts.py` — SLO & alert rules")
+        alerts_rc, alerts_out = run_script("scripts/validate_alerts.py")
+        st.code(alerts_out.strip() or "(không có output)", language="text")
+
+    with st.container(border=True):
+        st.markdown("#### `python -m pytest -q`")
+        if st.button("Chạy pytest", width="stretch"):
+            with st.spinner("Đang chạy test suite..."):
+                st.session_state["pytest"] = run_pytest()
+        result = st.session_state.get("pytest")
+        if result is None:
+            st.caption("Bấm nút để chạy toàn bộ test suite (mất vài giây).")
+        else:
+            rc, output = result
+            (st.success if rc == 0 else st.error)(
+                "Tất cả test pass" if rc == 0 else f"Test suite fail (exit code {rc})"
+            )
+            st.code(output.strip()[-4000:] or "(không có output)", language="text")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TOÀN CẢNH — màn hình dùng để chụp ảnh evidence
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def view_overview() -> None:
+    render_gate()
+    st.divider()
+
+    st.markdown("### 📈 6 panel bắt buộc")
+    st.markdown(
+        "<div class='lede'>latency · traffic · error · cost · token · quality — "
+        "đúng contract <code>config/dashboard.yaml</code>, có threshold và vùng incident.</div>",
+        unsafe_allow_html=True,
+    )
+    render_six_panels(metrics, windows_view)
+
+    st.divider()
+    st.markdown("### 🔁 Incident flow bắt buộc")
+    flow = st.columns(6)
+    flow_steps = [
+        ("1", "Metric bất thường", "P95 / error / cost lệch khỏi baseline"),
+        ("2", "Trace liên quan", "Correlation ID của request chậm nhất"),
+        ("3", "Log chứng minh", "Log JSON cùng correlation ID"),
+        ("4", "Root cause", "Hàm và cờ gây lỗi trong code"),
+        ("5", "Cách xử lý", "Tắt incident + guardrail"),
+        ("6", "Cách phòng ngừa", "Alert + health check + chaos test"),
+    ]
+    for column, (number, title, body) in zip(flow, flow_steps):
+        with column:
+            st.markdown(step_card(number, title, body), unsafe_allow_html=True)
+
+    st.caption("Chi tiết từng bước với dữ liệu thật: chọn **05 · Demo một incident** ở sidebar.")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ROUTER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+if view.startswith("🏁"):
+    view_overview()
+elif view.startswith("01"):
+    view_api()
+elif view.startswith("02"):
+    view_logging()
+elif view.startswith("03"):
+    view_dashboard()
+elif view.startswith("04"):
+    view_langfuse()
+elif view.startswith("05"):
+    view_incident()
+else:
+    view_validation()
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # FOOTER
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# Last incident summary
-if st.session_state.last_incident_time:
-    st.markdown(f"""
-    <div style="background: var(--bg-secondary); border: 1px solid var(--border-color); 
-                border-radius: 8px; padding: 1rem; margin: 1rem 0;">
-        <div style="display: flex; justify-content: space-between; align-items: center;">
-            <div>
-                <strong style="color: var(--accent-red);">🔴 Last Incident</strong>
-                <div style="color: var(--text-secondary); font-size: 0.85rem;">
-                    Injected at {st.session_state.last_incident_time.strftime('%Y-%m-%d %H:%M:%S')}
-                </div>
-            </div>
-            <div style="color: var(--text-secondary); font-size: 0.8rem;">
-                {int((datetime.now() - st.session_state.last_incident_time).total_seconds())}s ago
-            </div>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-# Footer
-st.markdown(f"""
-<div class="last-updated">
-    <strong>Day 13 AI Observability Dashboard</strong> • 
-    Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} • 
-    Source: {DATA_FILE.name} • 
-    Time range: {time_range_min} min
-</div>
-""", unsafe_allow_html=True)
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# AUTO-REFRESH (JavaScript)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-if auto_refresh:
-    st.markdown(f"""
-    <meta http-equiv="refresh" content="{REFRESH_SECONDS}">
-    <script>
-        setTimeout(function() {{
-            window.location.reload(1);
-        }}, {REFRESH_SECONDS * 1000});
-    </script>
-    """, unsafe_allow_html=True)
+st.divider()
+st.markdown(
+    f"<div style='color:{C_MUTED};font-size:12.5px;'>"
+    f"<b>Observe → Explain → Fix → Prevent</b> · Day 13 · Monitoring · Logging · Observability "
+    f"&nbsp;|&nbsp; nguồn <code>data/logs.jsonl</code> · contract <code>config/dashboard.yaml</code> "
+    f"· cập nhật {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    f"</div>",
+    unsafe_allow_html=True,
+)
