@@ -33,8 +33,10 @@
 
 - Kết quả `validate_dashboard.py`:
 - Evidence dashboard:
-- SLO đã chọn và lý do:
-- Alert rules và runbook:
+- SLO đã chọn và lý do: P95 latency <= 3000 ms và error rate <= 2% phản ánh trực tiếp trải nghiệm/độ tin cậy; daily cost <= 2.5 USD kiểm soát ngân sách; quality average >= 0.75 là guardrail chất lượng. Cửa sổ SLO là 28 ngày.
+- Alert rules và runbook: 3 alert symptom-based (`high_latency_p95`, `elevated_error_rate`, `cost_budget_exceeded`) đã đồng bộ objective với `config/slo.yaml`; mỗi alert có severity, duration, owner, ảnh hưởng, ba bước kiểm tra, mitigation và điều kiện đóng tại `docs/alerts.md`.
+- Kết quả `python scripts/validate_alerts.py`: `VALID: 4 SLOs, 3 symptom-based alerts, and 3 runbooks.`
+- Evidence cấu hình: `submission/evidence/cp2-alert-validation.txt`.
 
 ## 6. Điều tra challenge
 

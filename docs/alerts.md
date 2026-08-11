@@ -1,150 +1,92 @@
-# Alert Runbooks - Day 13 AI Observability
+# Alert runbook — Day 13 AI Observability
 
-## Alert 1: High Latency
+Runbook này dùng cùng SLI và ngưỡng trong `config/slo.yaml`. Người trực xử lý theo luồng **Metrics → Traces → Logs**, ghi lại thời điểm, correlation ID/trace ID, hành động giảm thiểu và kết quả. Không đưa API key hoặc PII vào evidence.
 
-**Tên:** High Latency P95  
-**Severity:** warning  
-**SLI/SLO liên quan:** `latency_p95_ms` → objective 3000ms, target 99.5%  
-**Điều kiện:** p95 latency > 3000ms trong 5 phút  
-**Ảnh hưởng:** Users experience slow responses, degraded UX  
-**Owner:** SRE  
+## Alert 1
 
-### Ba bước kiểm tra đầu tiên
+### High latency P95
 
-1. **Kiểm tra span traces trong Langfuse**
-   ```bash
-   # Truy cập Langfuse dashboard
-   # Filter: operation_name CONTAINS "llm" OR "retrieval"
-   # Sort by duration DESC
-   # Identify: slow RAG retrieval hay slow LLM response
-   ```
+- **Tên:** `high_latency_p95`
+- **Severity:** `warning`
+- **Owner:** `on-call-engineer`
+- **SLI/SLO:** `latency_p95_ms <= 3000 ms`; đạt cho ít nhất 99,5% cửa sổ trong 28 ngày.
+- **Điều kiện kích hoạt:** `latency_p95_ms > 3000` liên tục 5 phút.
+- **Ảnh hưởng người dùng:** phản hồi chat chậm, tăng tỷ lệ bỏ phiên hoặc gửi lại yêu cầu.
 
-2. **Phân tích thành phần chậm**
-   ```bash
-   # Query logs.jsonl để xác định latency breakdown
-   jq 'select(.event == "response_sent") | {latency_ms, rag_latency_ms, llm_latency_ms}' data/logs.jsonl | jq -s 'add | {avg_rag: (.[] | .rag_latency_ms) | add / length, avg_llm: (.[] | .llm_latency_ms) | add / length}'
-   ```
+Ba bước kiểm tra đầu tiên:
 
-3. **Check infrastructure metrics**
-   - CPU/Memory của inference server
-   - Vector DB query latency (Pinecone/Milvus metrics)
-   - Network latency đến LLM provider
+1. Mở panel **Latency**, xác nhận P95 vượt 3000 ms trong đúng cửa sổ cảnh báo; so sánh P50/P99 để phân biệt chậm diện rộng với outlier.
+2. Trong Langfuse, lọc trace cùng khoảng thời gian, sắp xếp theo duration giảm dần và mở một trace chậm. So sánh thời lượng span `retrieve`, `generate` và span cha `run` nếu sub-span đã được bật.
+3. Lấy correlation ID của trace/request và tìm `request_received` cùng `response_sent` trong `data/logs.jsonl`. Kiểm tra `latency_ms`, `feature`, `model` và trạng thái incident; không suy luận từ tên hàm đơn lẻ.
 
-### Mitigation tạm thời
+Mitigation tạm thời:
 
-```bash
-# Nếu RAG chậm: tăng vector DB connection pool
-# Nếu LLM chậm: kiểm tra provider status, consider fallback model
+- Nếu `retrieve` chậm: giảm tải truy vấn, dùng cache hoặc tạm giảm số tài liệu trả về.
+- Nếu `generate` chậm: chuyển sang model fallback đã được phê duyệt hoặc giảm giới hạn output.
+- Nếu toàn hệ thống chậm: giới hạn concurrency/rate và báo trạng thái dịch vụ cho nhóm.
+- Tắt incident practice sau khi kiểm chứng: `python scripts/inject_incident.py --scenario rag_slow --disable`.
 
-# Enable caching nếu chưa có
-export ENABLE_RESPONSE_CACHE=true
-```
+Điều kiện đóng alert: P95 dưới hoặc bằng 3000 ms ít nhất 10 phút, request mới hoạt động bình thường và evidence đã được lưu.
 
----
+## Alert 2
 
-## Alert 2: High Error Rate
+### Elevated error rate
 
-**Tên:** High Error Rate  
-**Severity:** critical  
-**SLI/SLO liên quan:** `error_rate_pct` → objective 2%, target 99.0%  
-**Điều kiện:** error_rate_pct > 2% trong 3 phút  
-**Ảnh hưởng:** Users nhận được error responses, possible data loss  
-**Owner:** Backend  
+- **Tên:** `elevated_error_rate`
+- **Severity:** `critical`
+- **Owner:** `on-call-engineer`
+- **SLI/SLO:** `error_rate_pct <= 2%`; đạt cho ít nhất 99% cửa sổ trong 28 ngày.
+- **Điều kiện kích hoạt:** `error_rate_pct > 2` liên tục 3 phút.
+- **Ảnh hưởng người dùng:** request chat thất bại hoặc nhận HTTP 5xx, không có câu trả lời hữu ích.
 
-### Ba bước kiểm tra đầu tiên
+Ba bước kiểm tra đầu tiên:
 
-1. **Check error logs**
-   ```bash
-   # Xem chi tiết errors gần đây
-   jq 'select(.event == "request_failed")' data/logs.jsonl | jq -s 'group_by(.error_type) | map({type: .[0].error_type, count: length})'
+1. Mở panel **Error**, xác nhận mẫu số traffic không bằng 0 và xem breakdown theo `error_type` để tìm nhóm lỗi chiếm ưu thế.
+2. Trong Langfuse, lọc trace lỗi theo cùng thời gian, feature và model; kiểm tra span cuối thành công và span đầu tiên lỗi.
+3. Dùng correlation ID để tìm event `request_failed`/`unhandled_exception` trong log; đối chiếu `error_type`, `feature`, `model` và thay đổi triển khai gần nhất.
 
-   # Error types phổ biến: "llm_timeout", "rag_empty_result", "validation_error", "auth_failed"
-   ```
+Mitigation tạm thời:
 
-2. **Correlate với recent deployments**
-   ```bash
-   # Kiểm tra git log gần đây
-   git log --oneline -10 --after="2 hours ago"
+- Cô lập feature lỗi hoặc giảm traffic tới dependency lỗi.
+- Dùng fallback/retry có giới hạn khi dependency tạm thời không ổn định; không retry lỗi validation.
+- Nếu lỗi xuất hiện ngay sau deployment, rollback theo quy trình của nhóm và giữ nguyên evidence trước rollback.
+- Với incident practice `tool_fail`, tắt bằng `python scripts/inject_incident.py --scenario tool_fail --disable`.
 
-   # Rollback nếu cần
-   git revert <commit_hash>
-   ```
+Điều kiện đóng alert: error rate không quá 2% ít nhất 10 phút, request kiểm thử thành công và không còn nhóm lỗi tăng bất thường.
 
-3. **Check error types breakdown**
-   ```bash
-   # Cụ thể hơn về từng loại error
-   jq 'select(.event == "request_failed") | {error_type, error_message, timestamp}' data/logs.jsonl | tail -20
-   ```
+## Alert 3
 
-### Mitigation tạm thời
+### Cost budget exceeded
 
-```bash
-# Nếu LLM errors: restart service hoặc switch provider
-# Nếu auth errors: kiểm tra API keys
-# Nếu validation errors: check input format
+- **Tên:** `cost_budget_exceeded`
+- **Severity:** `warning`
+- **Owner:** `team-lead`
+- **SLI/SLO:** `daily_cost_usd <= 2.5 USD` trên cửa sổ trượt 24 giờ.
+- **Điều kiện kích hoạt:** `daily_cost_usd > 2.5` liên tục 5 phút.
+- **Ảnh hưởng người dùng/kinh doanh:** vượt ngân sách có thể buộc giảm hạn mức, gián đoạn dịch vụ hoặc dùng model kém phù hợp.
 
-# Temporary: enable error bypass mode
-export ERROR_BYPASS_MODE=true
-```
+Ba bước kiểm tra đầu tiên:
 
----
+1. Mở panel **Cost** và **Traffic**; xác định chi phí tăng do traffic tăng hay chi phí trung bình mỗi request tăng.
+2. Trong Langfuse, lọc trace cùng cửa sổ và sắp xếp theo cost/tokens; đối chiếu model, feature, `tokens_in` và `tokens_out` của các trace đắt nhất.
+3. Dùng correlation ID của trace đắt để tìm `response_sent` trong log; kiểm tra `cost_usd`, token, model và trạng thái incident `cost_spike`.
 
-## Alert 3: Cost Spike
+Mitigation tạm thời:
 
-**Tên:** Cost Spike Alert  
-**Severity:** warning  
-**SLI/SLO liên quan:** `daily_cost_usd` → objective $2.5/day  
-**Điều kiện:** cost_usd > 2.5 trong 1 giờ (tức ~$0.10/phút)  
-**Ảnh hưởng:** Budget overrun, need to investigate expensive queries  
-**Owner:** Product  
+- Áp dụng rate limit theo user/session và giới hạn input/output token.
+- Chuyển workload phù hợp sang model rẻ hơn đã được phê duyệt; giữ model chất lượng cao cho yêu cầu cần thiết.
+- Giảm context dư thừa, cache kết quả an toàn và chặn vòng lặp retry không giới hạn.
+- Tắt incident practice: `python scripts/inject_incident.py --scenario cost_spike --disable`.
 
-### Ba bước kiểm tra đầu tiên
+Điều kiện đóng alert: tốc độ tăng chi phí trở lại bình thường, nguyên nhân đã được xác nhận và có kế hoạch đưa tổng chi phí cửa sổ 24 giờ về ngân sách.
 
-1. **Identify high-cost queries**
-   ```bash
-   # Top 10 queries by cost
-   jq 'select(.event == "response_sent") | {query_id, cost_usd, tokens_in, tokens_out, timestamp}' data/logs.jsonl | jq -s 'sort_by(.cost_usd) | reverse | .[:10]'
-   ```
+## Checklist evidence
 
-2. **Analyze token usage**
-   ```bash
-   # Total tokens trong 1 giờ
-   jq 'select(.event == "response_sent") | {tokens_in, tokens_out}' data/logs.jsonl | jq -s '{(add | .tokens_in), (add | .tokens_out)}'
+- Ảnh panel có time range và đường SLO/threshold.
+- Trace ID và correlation ID đại diện; không chứa PII.
+- Dòng log chứng minh triệu chứng/root cause.
+- Thời điểm bắt đầu/kết thúc, owner, mitigation và kết quả xác minh.
 
-   # Identify high token queries (possible prompt injection hoặc loops)
-   jq 'select(.event == "response_sent" and (.tokens_in > 5000 or .tokens_out > 2000))' data/logs.jsonl
-   ```
+## Câu hỏi phản biện
 
-3. **Check for anomalies**
-   ```bash
-   # Số lượng requests bất thường
-   jq 'select(.event == "request_received")' data/logs.jsonl | jq -s 'length'
-
-   # Nếu traffic spike: kiểm tra DoS hoặc abuse
-   ```
-
-### Mitigation tạm thời
-
-```bash
-# Enable rate limiting
-export RATE_LIMIT_RPM=60
-
-# Nếu specific query gây spike: block or throttle
-# Consider using cheaper model cho simple queries
-export LOW_COST_MODEL=gpt-3.5-turbo
-```
-
----
-
-## General Commands
-
-```bash
-# Real-time monitoring
-tail -f data/logs.jsonl | jq 'select(.event | IN("response_sent", "request_failed"))'
-
-# Calculate current SLO burn rate
-python scripts/check_slo.py
-
-# Export metrics for analysis
-jq -r '@json' data/logs.jsonl > /tmp/metrics.json
-```
+Alert nên dựa trên triệu chứng người dùng thấy vì nó phản ánh trực tiếp độ tin cậy của dịch vụ, không phụ thuộc cấu trúc triển khai và vẫn đúng khi code được refactor. Tên hàm hoặc lỗi nội bộ phù hợp cho chẩn đoán sau khi alert đã kích hoạt, nhưng nếu dùng làm điều kiện cảnh báo chính sẽ dễ gây nhiễu và có thể bỏ sót lỗi có cùng tác động từ component khác.
