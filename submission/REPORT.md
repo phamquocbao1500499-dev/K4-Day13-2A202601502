@@ -9,9 +9,9 @@
 
 ## 2. Kết quả kỹ thuật
 
-- Điểm `validate_logs.py`:
-- Tổng số traces:
-- Số PII leak còn lại:
+- Điểm `validate_logs.py`: 30/100 (baseline — Total log records analyzed: 24; Records with missing required fields: 20; Records with missing enrichment (context): 20; Unique correlation IDs found: 0; Potential PII leaks detected: 0)
+- Tổng số traces: 0 (chưa có correlation ID nào được propagate)
+- Số PII leak còn lại: 0
 - Link/đường dẫn dashboard:
 
 ## 3. Logging và tracing
