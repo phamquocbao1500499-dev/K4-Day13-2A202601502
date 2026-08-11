@@ -35,8 +35,8 @@ def load_logs():
                 records.append(_json.loads(line))
     df = pd.DataFrame(records)
     if "ts" in df.columns:
-        df["ts"] = pd.to_datetime(df["ts"], errors="coerce")
-        cutoff = pd.Timestamp.now() - pd.Timedelta(minutes=time_range_min)
+        df["ts"] = pd.to_datetime(df["ts"], errors="coerce", utc=True)
+        cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(minutes=time_range_min)
         df = df[df["ts"] >= cutoff]
     return df
 

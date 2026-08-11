@@ -38,13 +38,27 @@
 
 ## 6. Điều tra challenge
 
-- Challenge ID:
-- Triệu chứng từ metrics:
-- Trace ID liên quan:
-- Log line/correlation ID liên quan:
-- Root cause:
-- Fix action:
-- Preventive measure:
+- **Challenge ID**: day13-k4-observability-v1
+- **Triệu chứng từ metrics**: 
+  - P95 latency tăng từ ~1200ms (baseline) lên ~3600ms (incident active)
+  - Tất cả 5 challenge queries đều vượt ngưỡng 2000ms (3559-3644ms)
+  - 17 requests vượt 2500ms sau khi incident enabled
+- **Trace ID liên quan**: req-34b4f1a7, req-f85346e6, req-fdcb9057, req-abe50d4a, req-d43133da (tất cả feature=monitoring)
+- **Log line/correlation ID liên quan**: 
+  - Line 149: incident_enabled (rag_slow) tại ts 08:26:47
+  - Lines 150-159: 5 challenge requests với latency 3559-3644ms
+  - Line 181: incident_disabled tại ts 08:28:53
+- **Root cause**: RAG retrieval slowness - `app/mock_rag.py` thêm 2500ms delay khi `STATE["rag_slow"]=True`
+- **Fix action**: 
+  1. Disable incident qua control event
+  2. Thêm timeout/circuit breaker cho RAG retrieval
+  3. Implement async retrieval với fallback cached results
+- **Preventive measure**:
+  1. SLO alert P95 latency tại 1500ms
+  2. RAG health check synthetic query
+  3. Circuit breaker pattern cho external calls
+  4. Trace spans cho `retrieve()` để identify slowness
+  5. Chaos testing với RAG slowness scenario
 
 ## 7. Đóng góp cá nhân
 

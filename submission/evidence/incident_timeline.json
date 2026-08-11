@@ -1,0 +1,48 @@
+{
+  "incident": "rag_slow",
+  "control_events": [
+    {
+      "event": "incident_enabled",
+      "log_line": 149,
+      "timestamp": "2026-08-11T08:26:47.110871Z",
+      "correlation_id": "req-f5f6b4b8",
+      "impact": "All requests now experiencing +2500ms latency"
+    },
+    {
+      "event": "incident_enabled",
+      "log_line": 160,
+      "timestamp": "2026-08-11T08:27:45.273508Z",
+      "correlation_id": "req-1b2b45bc",
+      "impact": "Re-enabled after disable window"
+    },
+    {
+      "event": "incident_disabled",
+      "log_line": 181,
+      "timestamp": "2026-08-11T08:28:53.652471Z",
+      "correlation_id": "req-e641c524",
+      "impact": "Latency returns to normal baseline"
+    }
+  ],
+  "timeline": {
+    "baseline_period": {
+      "start": "2026-08-11T08:12:18.710757Z",
+      "end": "2026-08-11T08:26:47.110871Z",
+      "p95_latency_ms": 1189,
+      "max_latency_ms": 1418,
+      "exceeds_threshold_count": 0
+    },
+    "incident_active_period": {
+      "start": "2026-08-11T08:26:47.110871Z",
+      "end": "2026-08-11T08:28:53.652471Z",
+      "p95_latency_ms": 3644,
+      "max_latency_ms": 3664,
+      "exceeds_threshold_count": 17
+    }
+  },
+  "mechanism": {
+    "file": "app/mock_rag.py",
+    "function": "retrieve()",
+    "injected_delay_ms": 2500,
+    "trigger": "STATE['rag_slow'] = True"
+  }
+}

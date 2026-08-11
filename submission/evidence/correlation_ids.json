@@ -1,0 +1,77 @@
+{
+  "challenge_id": "day13-k4-observability-v1",
+  "incident": "rag_slow",
+  "latency_threshold_ms": 2000,
+  "challenge_correlation_ids": [
+    {
+      "correlation_id": "req-34b4f1a7",
+      "session_id": "k4-challenge-s03",
+      "user_id_hash": "cbc3dffc63cf",
+      "feature": "monitoring",
+      "message_preview": "Summarize the observability workflow for an AI API.",
+      "latency_ms": 3644,
+      "exceeds_threshold": true,
+      "excess_ms": 1644,
+      "log_line_start": 150,
+      "log_line_end": 151
+    },
+    {
+      "correlation_id": "req-f85346e6",
+      "session_id": "k4-challenge-s02",
+      "user_id_hash": "cb22af258a5e",
+      "feature": "monitoring",
+      "message_preview": "How should an engineer investigate tail latency?",
+      "latency_ms": 3568,
+      "exceeds_threshold": true,
+      "excess_ms": 1568,
+      "log_line_start": 152,
+      "log_line_end": 153
+    },
+    {
+      "correlation_id": "req-fdcb9057",
+      "session_id": "k4-challenge-s05",
+      "user_id_hash": "0c04335fe098",
+      "feature": "monitoring",
+      "message_preview": "Describe how to prove a slow span is the root cause.",
+      "latency_ms": 3559,
+      "exceeds_threshold": true,
+      "excess_ms": 1559,
+      "log_line_start": 154,
+      "log_line_end": 155
+    },
+    {
+      "correlation_id": "req-abe50d4a",
+      "session_id": "k4-challenge-s01",
+      "user_id_hash": "f00ba60b3772",
+      "feature": "monitoring",
+      "message_preview": "Explain why metrics traces and logs work together.",
+      "latency_ms": 3578,
+      "exceeds_threshold": true,
+      "excess_ms": 1578,
+      "log_line_start": 156,
+      "log_line_end": 157
+    },
+    {
+      "correlation_id": "req-d43133da",
+      "session_id": "k4-challenge-s04",
+      "user_id_hash": "6b83e74c0874",
+      "feature": "monitoring",
+      "message_preview": "Which signal should be checked after latency increases?",
+      "latency_ms": 3610,
+      "exceeds_threshold": true,
+      "excess_ms": 1610,
+      "log_line_start": 158,
+      "log_line_end": 159
+    }
+  ],
+  "statistics": {
+    "challenge_requests": 5,
+    "exceeds_threshold": 5,
+    "p95_latency_ms": 3610,
+    "max_latency_ms": 3644,
+    "min_latency_ms": 3559,
+    "avg_latency_ms": 3591.8,
+    "threshold_ms": 2000,
+    "avg_excess_ms": 1591.8
+  }
+}
