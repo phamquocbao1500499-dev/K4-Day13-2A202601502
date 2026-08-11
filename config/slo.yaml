@@ -1,16 +1,40 @@
 service: day13-observability-lab
 window: 28d
+description: SLOs are evaluated from response_sent and request_failed events.
+
 slis:
   latency_p95_ms:
+    description: End-to-end P95 latency of successful chat requests.
+    indicator: p95(response_sent.latency_ms)
     objective: 3000
+    unit: ms
+    comparison: lte
     target: 99.5
-    note: Replace with your group's target
+    evaluation_window: 5m
+
   error_rate_pct:
+    description: Percentage of received requests that fail.
+    indicator: count(request_failed) / count(request_received) * 100
     objective: 2
+    unit: percent
+    comparison: lte
     target: 99.0
+    evaluation_window: 3m
+
   daily_cost_usd:
+    description: Total model cost over a rolling 24-hour window.
+    indicator: sum(response_sent.cost_usd) over 24h
     objective: 2.5
+    unit: usd_per_day
+    comparison: lte
     target: 100.0
+    evaluation_window: 5m
+
   quality_score_avg:
+    description: Mean quality proxy of successful chat responses.
+    indicator: mean(response_sent.quality_score)
     objective: 0.75
+    unit: score_0_to_1
+    comparison: gte
     target: 95.0
+    evaluation_window: 15m

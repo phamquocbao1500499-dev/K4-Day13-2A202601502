@@ -1,27 +1,30 @@
 alerts:
-  - name: High Latency P95
+  - name: high_latency_p95
+    summary: Users are waiting more than three seconds for chat responses.
     severity: warning
     condition: latency_p95_ms > 3000 for 5m
     type: symptom-based
-    owner: SRE
-    runbook: docs/alerts.md#alert-1
+    owner: on-call-engineer
     sli: latency_p95_ms
     objective: 3000
+    runbook: docs/alerts.md#alert-1
 
-  - name: High Error Rate
+  - name: elevated_error_rate
+    summary: More than two percent of chat requests are failing.
     severity: critical
     condition: error_rate_pct > 2 for 3m
     type: symptom-based
-    owner: Backend
-    runbook: docs/alerts.md#alert-2
+    owner: on-call-engineer
     sli: error_rate_pct
     objective: 2
+    runbook: docs/alerts.md#alert-2
 
-  - name: Cost Spike
+  - name: cost_budget_exceeded
+    summary: Rolling 24-hour model cost has exceeded the daily budget.
     severity: warning
-    condition: cost_usd > 2.5 per hour
+    condition: daily_cost_usd > 2.5 for 5m
     type: symptom-based
-    owner: Product
-    runbook: docs/alerts.md#alert-3
+    owner: team-lead
     sli: daily_cost_usd
     objective: 2.5
+    runbook: docs/alerts.md#alert-3
