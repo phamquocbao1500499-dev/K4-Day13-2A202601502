@@ -1,19 +1,27 @@
 alerts:
-  - name: TODO_alert_1
-    severity: TODO
-    condition: TODO
+  - name: High Latency P95
+    severity: warning
+    condition: latency_p95_ms > 3000 for 5m
     type: symptom-based
-    owner: TODO
+    owner: SRE
     runbook: docs/alerts.md#alert-1
-  - name: TODO_alert_2
-    severity: TODO
-    condition: TODO
+    sli: latency_p95_ms
+    objective: 3000
+
+  - name: High Error Rate
+    severity: critical
+    condition: error_rate_pct > 2 for 3m
     type: symptom-based
-    owner: TODO
+    owner: Backend
     runbook: docs/alerts.md#alert-2
-  - name: TODO_alert_3
-    severity: TODO
-    condition: TODO
+    sli: error_rate_pct
+    objective: 2
+
+  - name: Cost Spike
+    severity: warning
+    condition: cost_usd > 2.5 per hour
     type: symptom-based
-    owner: TODO
+    owner: Product
     runbook: docs/alerts.md#alert-3
+    sli: daily_cost_usd
+    objective: 2.5
